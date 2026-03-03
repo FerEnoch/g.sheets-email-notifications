@@ -4,7 +4,7 @@
  * ================================================================================
  * 
  * This Google Apps Script adds intelligent task change notifications to your
- * project management spreadsheet.
+ * project management spreadsheet.MP
  * 
  * Features:
  * - Automatically detects changes in tasks across all sheets
@@ -86,6 +86,59 @@ const CONFIG = {
       `• ${unchangedCount} tarea(s) sin cambios (no notificadas)\n\n` +
       `📧 Correos enviados a ${emailsSent} asignado(s)\n\n` +
       `Snapshot guardado en la hoja ${CONFIG.HISTORY_SHEET_NAME}.`
+  },
+
+  // ================================================================================
+  // MEETINGS CONFIGURATION
+  // ================================================================================
+  
+  MEETINGS: {
+    SHEET_NAME: 'Reuniones',
+    HISTORY_SHEET_NAME: '_meetings_history',
+    EMAIL_SUBJECT: 'Reunión de equipo - convocatoria',
+    MENU_ITEM: 'Notificar reuniones',
+    
+    COLUMNS: {
+      TITLE: 0,         // Columna A
+      ATTENDEES: 1,     // Columna B
+      STATUS: 2,        // Columna C
+      DATETIME: 3,      // Columna D
+      AGENDA: 4,        // Columna E
+      DOCUMENTATION: 5  // Columna F
+    },
+    
+    HEADER_ROW: 1,
+    FIRST_DATA_ROW: 2,
+    
+    MONITORED_FIELDS: ['TITLE', 'ATTENDEES', 'STATUS', 'DATETIME', 'AGENDA', 'DOCUMENTATION'],
+    
+    FIELD_NAMES: {
+      TITLE: 'Reunión',
+      ATTENDEES: 'Asistentes',
+      STATUS: 'Estado',
+      DATETIME: 'Fecha y hora',
+      AGENDA: 'Agenda',
+      DOCUMENTATION: 'Documentación'
+    },
+    
+    HISTORY_HEADERS: [
+      'Timestamp', 'ID Reunión', 'Título', 'Asistentes',
+      'Estado', 'Fecha_hora', 'Agenda', 'Documentación',
+      'Acción', 'Notificado'
+    ],
+    
+    ALERTS: {
+      NO_MEETINGS: 'No se encontraron reuniones en la hoja. Por favor, agregue reuniones primero.',
+      SUMMARY_TITLE: '✓ Resumen de notificaciones de reuniones',
+      SUMMARY_MESSAGE: (totalMeetings, newCount, changedCount, deletedCount, unchangedCount, emailsSent) =>
+        `• ${totalMeetings} reunión(es) escaneada(s)\n` +
+        `• ${newCount} reunión(es) nueva(s) detectada(s)\n` +
+        `• ${changedCount} reunión(es) cambiada(s)\n` +
+        `• ${deletedCount} reunión(es) eliminada(s)\n` +
+        `• ${unchangedCount} reunión(es) sin cambios (no notificadas)\n\n` +
+        `📧 Correos enviados a ${emailsSent} asistente(s)\n\n` +
+        `Snapshot guardado en la hoja ${CONFIG.MEETINGS.HISTORY_SHEET_NAME}.`
+    }
   }
 };
 
@@ -102,6 +155,7 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu(CONFIG.SPREADSHEET_MENU_NAME)
     .addItem(CONFIG.SPREADSHEET_MENU_ITEM, 'notifyTaskAssignees')
+    .addItem(CONFIG.MEETINGS.MENU_ITEM, 'notifyMeetingAttendees')
     .addToUi();
 }
 
@@ -168,6 +222,63 @@ function notifyTaskAssignees() {
   }
 }
 
+/**
+ * Main function for meeting notifications
+ * Called when user clicks "Notify meetings" menu button
+ */
+function notifyMeetingAttendees() {
+  try {
+    const startTime = new Date();
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+
+    // Step 1: Ensure Meetings History sheet exists
+    createMeetingsHistorySheet();
+
+    // Step 2: Get all current meetings from Reuniones sheet
+    const currentMeetings = getAllMeetings();
+
+    if (currentMeetings.length === 0) {
+      SpreadsheetApp.getUi().alert(CONFIG.MEETINGS.ALERTS.NO_MEETINGS);
+      return;
+    }
+
+    // Step 3: Load previous snapshot from Meetings History sheet
+    const previousSnapshot = getPreviousMeetingsSnapshot();
+
+    // Step 4: Compare current vs previous and detect changes
+    const changes = compareMeetingsSnapshots(currentMeetings, previousSnapshot);
+
+    // Step 5: Send notifications only for changed meetings
+    const notificationStats = sendMeetingNotifications(changes, spreadsheet.getUrl());
+
+    // Step 6: Save current snapshot to Meetings History sheet
+    saveMeetingsSnapshot(currentMeetings, changes);
+
+    // Step 7: Show summary to user
+    const totalMeetings = currentMeetings.length;
+    const newCount = changes.new.length;
+    const changedCount = changes.changed.length;
+    const deletedCount = changes.deleted.length;
+    const unchangedCount = changes.unchanged.length;
+
+    const summary = CONFIG.MEETINGS.ALERTS.SUMMARY_MESSAGE(
+      totalMeetings,
+      newCount,
+      changedCount,
+      deletedCount,
+      unchangedCount,
+      notificationStats.emailsSent
+    );
+
+    SpreadsheetApp.getUi().alert(CONFIG.MEETINGS.ALERTS.SUMMARY_TITLE, summary, SpreadsheetApp.getUi().ButtonSet.OK);
+
+  } catch (error) {
+    Logger.log('Error in notifyMeetingAttendees: ' + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+
 
 // ================================================================================
 // SECTION 4: TASK DATA COLLECTION
@@ -201,11 +312,12 @@ function getAllTasks() {
 
     data.forEach((row, index) => {
       const actualRowIndex = CONFIG.FIRST_DATA_ROW + index;
-      const task = getTaskFromRow(sheet, row, actualRowIndex);
+      const taskOrTasks = getTaskFromRow(sheet, row, actualRowIndex);
 
-      // Only add tasks with valid email addresses
-      if (task && task.email && isValidEmail(task.email)) {
-        allTasks.push(task);
+      // getTaskFromRow now returns null or an array of task objects
+      if (taskOrTasks && Array.isArray(taskOrTasks)) {
+        // Add all tasks from the array (one per assignee)
+        allTasks.push(...taskOrTasks);
       }
     });
   });
@@ -214,34 +326,133 @@ function getAllTasks() {
 }
 
 /**
+ * Scans the Reuniones sheet and extracts all meetings
+ * @returns {Array} Array of meeting objects with all fields
+ */
+function getAllMeetings() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = spreadsheet.getSheetByName(CONFIG.MEETINGS.SHEET_NAME);
+  const allMeetings = [];
+
+  // Return empty array if Reuniones sheet doesn't exist
+  if (!sheet) {
+    Logger.log('Reuniones sheet not found');
+    return allMeetings;
+  }
+
+  const lastRow = sheet.getLastRow();
+
+  // Skip if sheet is empty or has only headers
+  if (lastRow < CONFIG.MEETINGS.FIRST_DATA_ROW) {
+    return allMeetings;
+  }
+
+  // Get all data rows (skip header)
+  const dataRange = sheet.getRange(CONFIG.MEETINGS.FIRST_DATA_ROW, 1, lastRow - CONFIG.MEETINGS.HEADER_ROW, 6);
+  const data = dataRange.getValues();
+
+  data.forEach((row, index) => {
+    const actualRowIndex = CONFIG.MEETINGS.FIRST_DATA_ROW + index;
+    const meetingOrMeetings = getMeetingFromRow(sheet, row, actualRowIndex);
+
+    // getMeetingFromRow returns null or an array of meeting objects
+    if (meetingOrMeetings && Array.isArray(meetingOrMeetings)) {
+      // Add all meetings from the array (one per attendee)
+      allMeetings.push(...meetingOrMeetings);
+    }
+  });
+
+  return allMeetings;
+}
+
+/**
+ * Extracts meeting data from a spreadsheet row
+ * @param {Sheet} sheet - The sheet containing the meeting
+ * @param {Array} row - Row data array
+ * @param {number} rowIndex - Actual row number in sheet
+ * @returns {Array|null} Array of meeting objects (one per attendee) or null if no valid emails
+ */
+function getMeetingFromRow(sheet, row, rowIndex) {
+  const attendeesString = row[CONFIG.MEETINGS.COLUMNS.ATTENDEES];
+
+  // Skip rows without attendees
+  if (!attendeesString || attendeesString.toString().trim() === '') {
+    return null;
+  }
+
+  // Parse multiple emails from the string
+  const emailList = parseMultipleEmails(attendeesString);
+
+  // Skip if no valid emails found
+  if (emailList.length === 0) {
+    return null;
+  }
+
+  // Create one meeting object per attendee
+  return emailList.map(email => ({
+    meetingId: generateMeetingId(sheet.getName(), rowIndex),
+    sheetName: sheet.getName(),
+    rowNumber: rowIndex,
+    title: sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.TITLE]),
+    attendees: attendeesString.toString().trim(), // Keep full list for display
+    email: email, // Individual email for routing
+    status: sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.STATUS]),
+    datetime: row[CONFIG.MEETINGS.COLUMNS.DATETIME], // Date object from Google Sheets
+    agenda: sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.AGENDA]),
+    documentation: sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.DOCUMENTATION])
+  }));
+}
+
+/**
+ * Generates unique meeting ID from sheet name and row number
+ * @param {string} sheetName - Name of the sheet
+ * @param {number} rowIndex - Row number
+ * @returns {string} Unique meeting ID
+ */
+function generateMeetingId(sheetName, rowIndex) {
+  return `${sheetName}_Row${rowIndex}`;
+}
+
+
+/**
  * Extracts task data from a spreadsheet row
  * @param {Sheet} sheet - The sheet containing the task
  * @param {Array} row - Row data array
  * @param {number} rowIndex - Actual row number in sheet
- * @returns {Object} Task object with all fields
+ * @returns {Array|null} Array of task objects (one per assignee) or null if no valid emails
  */
 function getTaskFromRow(sheet, row, rowIndex) {
-  const email = row[CONFIG.COLUMNS.EMAIL];
+  const emailString = row[CONFIG.COLUMNS.EMAIL];
 
   // Skip rows without email
-  if (!email || email.toString().trim() === '') {
+  if (!emailString || emailString.toString().trim() === '') {
     return null;
   }
 
-  return {
+  // Parse multiple emails from the string
+  const emailList = parseMultipleEmails(emailString);
+
+  // Skip if no valid emails found
+  if (emailList.length === 0) {
+    return null;
+  }
+
+  // Create one task object per assignee
+  return emailList.map(email => ({
     taskId: generateTaskId(sheet.getName(), rowIndex),
     sheetName: sheet.getName(),
     rowNumber: rowIndex,
     task: sanitizeValue(row[CONFIG.COLUMNS.TASK]),
     priority: sanitizeValue(row[CONFIG.COLUMNS.PRIORITY]),
-    email: email.toString().trim().toLowerCase(),
+    assignees: emailString.toString().trim(), // Keep full list for display
+    email: email, // Individual email for routing
     status: sanitizeValue(row[CONFIG.COLUMNS.STATUS]),
     initDate: row[CONFIG.COLUMNS.INIT_DATE],
     finishDate: row[CONFIG.COLUMNS.FINISH_DATE],
     hits: sanitizeValue(row[CONFIG.COLUMNS.HITS]),
     product: sanitizeValue(row[CONFIG.COLUMNS.PRODUCT]),
     notes: sanitizeValue(row[CONFIG.COLUMNS.NOTES])
-  };
+  }));
 }
 
 
@@ -269,7 +480,7 @@ function createHistorySheet() {
 
 /**
  * Loads the most recent snapshot of each task from History sheet
- * @returns {Map} Map of taskId to most recent task state
+ * @returns {Map} Map of taskId+email to most recent task state
  */
 function getPreviousSnapshot() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
@@ -286,20 +497,25 @@ function getPreviousSnapshot() {
   const lastRow = historySheet.getLastRow();
   const data = historySheet.getRange(2, 1, lastRow - 1, CONFIG.HISTORY_SHEET_HEADERS.length).getValues();
 
-  // Build map of most recent state for each task
+  // Build map of most recent state for each task+email combination
   // Process rows from newest to oldest (reverse)
   for (let i = data.length - 1; i >= 0; i--) {
     const row = data[i];
     const taskId = row[2]; // Task ID column
+    const email = row[5]; // Email column
+    
+    // Create unique key combining taskId and email
+    const key = `${taskId}|${email}`;
 
-    // Only store the first (most recent) occurrence of each task ID
-    if (!snapshot.has(taskId)) {
-      snapshot.set(taskId, {
+    // Only store the first (most recent) occurrence of each task+email combination
+    if (!snapshot.has(key)) {
+      snapshot.set(key, {
         taskId: taskId,
         sheetName: row[1],
         task: row[3],
         priority: row[4],
-        email: row[5],
+        assignees: row[5], // Will be treated as assignees field
+        email: email,
         status: row[6],
         initDate: row[7],
         finishDate: row[8],
@@ -390,6 +606,141 @@ function saveSnapshot(tasks, changes) {
   }
 }
 
+/**
+ * Creates the Meetings History sheet if it doesn't exist
+ */
+function createMeetingsHistorySheet() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  let historySheet = spreadsheet.getSheetByName(CONFIG.MEETINGS.HISTORY_SHEET_NAME);
+
+  if (!historySheet) {
+    historySheet = spreadsheet.insertSheet(CONFIG.MEETINGS.HISTORY_SHEET_NAME);
+
+    historySheet.getRange(1, 1, 1, CONFIG.MEETINGS.HISTORY_HEADERS.length).setValues([CONFIG.MEETINGS.HISTORY_HEADERS]);
+    historySheet.getRange(1, 1, 1, CONFIG.MEETINGS.HISTORY_HEADERS.length).setFontWeight('bold');
+    historySheet.setFrozenRows(1);
+
+    Logger.log('Created Meetings History sheet');
+  }
+}
+
+/**
+ * Loads the most recent snapshot of each meeting from Meetings History sheet
+ * @returns {Map} Map of meetingId+email to most recent meeting state
+ */
+function getPreviousMeetingsSnapshot() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const historySheet = spreadsheet.getSheetByName(CONFIG.MEETINGS.HISTORY_SHEET_NAME);
+
+  const snapshot = new Map();
+
+  if (!historySheet || historySheet.getLastRow() <= 1) {
+    // No history exists yet
+    return snapshot;
+  }
+
+  // Get all history data
+  const lastRow = historySheet.getLastRow();
+  const data = historySheet.getRange(2, 1, lastRow - 1, CONFIG.MEETINGS.HISTORY_HEADERS.length).getValues();
+
+  // Build map of most recent state for each meeting+email combination
+  // Process rows from newest to oldest (reverse)
+  for (let i = data.length - 1; i >= 0; i--) {
+    const row = data[i];
+    const meetingId = row[1]; // Meeting ID column
+    const email = row[3]; // Attendees column (we'll extract individual email)
+    
+    // Create unique key combining meetingId and email
+    const key = `${meetingId}|${email}`;
+
+    // Only store the first (most recent) occurrence of each meeting+email combination
+    if (!snapshot.has(key)) {
+      snapshot.set(key, {
+        meetingId: meetingId,
+        title: row[2],
+        attendees: row[3],
+        email: email,
+        status: row[4],
+        datetime: row[5],
+        agenda: row[6],
+        documentation: row[7],
+        action: row[8]
+      });
+    }
+  }
+
+  return snapshot;
+}
+
+/**
+ * Saves current meetings snapshot to Meetings History sheet
+ * @param {Array} meetings - Current meeting list
+ * @param {Object} changes - Change detection results
+ */
+function saveMeetingsSnapshot(meetings, changes) {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const historySheet = spreadsheet.getSheetByName(CONFIG.MEETINGS.HISTORY_SHEET_NAME);
+
+  if (!historySheet) {
+    return;
+  }
+
+  const timestamp = formatDateTime(new Date());
+  const rows = [];
+
+  // Create a set of notified meeting IDs
+  const notifiedIds = new Set();
+  changes.new.forEach(m => notifiedIds.add(m.meetingId));
+  changes.changed.forEach(m => notifiedIds.add(m.meeting.meetingId));
+
+  // Add current state of all meetings
+  meetings.forEach(meeting => {
+    let action = 'UNCHANGED';
+    if (changes.new.find(m => m.meetingId === meeting.meetingId)) {
+      action = 'NEW';
+    } else if (changes.changed.find(m => m.meeting.meetingId === meeting.meetingId)) {
+      action = 'CHANGED';
+    }
+
+    const notified = notifiedIds.has(meeting.meetingId) ? 'YES' : 'NO';
+
+    rows.push([
+      timestamp,
+      meeting.meetingId,
+      meeting.title,
+      meeting.email, // Individual email for this attendee
+      meeting.status,
+      formatMeetingDateTime(meeting.datetime),
+      meeting.agenda,
+      meeting.documentation,
+      action,
+      notified
+    ]);
+  });
+
+  // Add deleted meetings
+  changes.deleted.forEach(meeting => {
+    rows.push([
+      timestamp,
+      meeting.meetingId,
+      meeting.title,
+      meeting.email,
+      meeting.status,
+      formatMeetingDateTime(meeting.datetime),
+      meeting.agenda,
+      meeting.documentation,
+      'DELETED',
+      'YES'
+    ]);
+  });
+
+  if (rows.length > 0) {
+    const lastRow = historySheet.getLastRow();
+    historySheet.getRange(lastRow + 1, 1, rows.length, 10).setValues(rows);
+  }
+}
+
+
 
 // ================================================================================
 // SECTION 6: CHANGE DETECTION
@@ -398,7 +749,7 @@ function saveSnapshot(tasks, changes) {
 /**
  * Compares current tasks with previous snapshot to detect changes
  * @param {Array} currentTasks - Current task list
- * @param {Map} previousSnapshot - Previous task states
+ * @param {Map} previousSnapshot - Previous task states (keyed by taskId+email)
  * @returns {Object} Categorized changes: {new, changed, deleted, unchanged}
  */
 function compareSnapshots(currentTasks, previousSnapshot) {
@@ -409,18 +760,19 @@ function compareSnapshots(currentTasks, previousSnapshot) {
     unchanged: []
   };
 
-  const currentTaskIds = new Set();
+  const currentKeys = new Set();
 
   // Check each current task
   currentTasks.forEach(currentTask => {
-    currentTaskIds.add(currentTask.taskId);
+    const key = `${currentTask.taskId}|${currentTask.email}`;
+    currentKeys.add(key);
 
-    if (!previousSnapshot.has(currentTask.taskId)) {
-      // New task
+    if (!previousSnapshot.has(key)) {
+      // New task (or new assignee to existing task)
       changes.new.push(currentTask);
     } else {
-      // Existing task - check for changes
-      const previousTask = previousSnapshot.get(currentTask.taskId);
+      // Existing task+email - check for changes
+      const previousTask = previousSnapshot.get(key);
       const fieldChanges = detectFieldChanges(currentTask, previousTask);
 
       if (fieldChanges.length > 0) {
@@ -435,9 +787,9 @@ function compareSnapshots(currentTasks, previousSnapshot) {
     }
   });
 
-  // Check for deleted tasks
-  previousSnapshot.forEach((previousTask, taskId) => {
-    if (!currentTaskIds.has(taskId) && previousTask.action !== 'DELETED') {
+  // Check for deleted tasks (or removed assignees)
+  previousSnapshot.forEach((previousTask, key) => {
+    if (!currentKeys.has(key) && previousTask.action !== 'DELETED') {
       changes.deleted.push(previousTask);
     }
   });
@@ -519,6 +871,115 @@ function detectFieldChanges(currentTask, previousTask) {
 function generateTaskId(sheetName, rowIndex) {
   return `${sheetName}_Row${rowIndex}`;
 }
+
+/**
+ * Compares current meetings with previous snapshot to detect changes
+ * @param {Array} currentMeetings - Current meeting list
+ * @param {Map} previousSnapshot - Previous meeting states (keyed by meetingId+email)
+ * @returns {Object} Categorized changes: {new, changed, deleted, unchanged}
+ */
+function compareMeetingsSnapshots(currentMeetings, previousSnapshot) {
+  const changes = {
+    new: [],
+    changed: [],
+    deleted: [],
+    unchanged: []
+  };
+
+  const currentKeys = new Set();
+
+  // Check each current meeting
+  currentMeetings.forEach(currentMeeting => {
+    const key = `${currentMeeting.meetingId}|${currentMeeting.email}`;
+    currentKeys.add(key);
+
+    if (!previousSnapshot.has(key)) {
+      // New meeting (or new attendee to existing meeting)
+      changes.new.push(currentMeeting);
+    } else {
+      // Existing meeting+email - check for changes
+      const previousMeeting = previousSnapshot.get(key);
+      const fieldChanges = detectMeetingFieldChanges(currentMeeting, previousMeeting);
+
+      if (fieldChanges.length > 0) {
+        changes.changed.push({
+          meeting: currentMeeting,
+          changes: fieldChanges,
+          previousMeeting: previousMeeting
+        });
+      } else {
+        changes.unchanged.push(currentMeeting);
+      }
+    }
+  });
+
+  // Check for deleted meetings (or removed attendees)
+  previousSnapshot.forEach((previousMeeting, key) => {
+    if (!currentKeys.has(key) && previousMeeting.action !== 'DELETED') {
+      changes.deleted.push(previousMeeting);
+    }
+  });
+
+  return changes;
+}
+
+/**
+ * Detects which specific fields changed between two meeting versions
+ * @param {Object} currentMeeting - Current meeting state
+ * @param {Object} previousMeeting - Previous meeting state
+ * @returns {Array} Array of change objects: [{field, oldValue, newValue}]
+ */
+function detectMeetingFieldChanges(currentMeeting, previousMeeting) {
+  const fieldChanges = [];
+
+  CONFIG.MEETINGS.MONITORED_FIELDS.forEach(fieldKey => {
+    let currentValue, previousValue;
+
+    // Map field keys to meeting object properties
+    switch (fieldKey) {
+      case 'TITLE':
+        currentValue = currentMeeting.title;
+        previousValue = previousMeeting.title;
+        break;
+      case 'ATTENDEES':
+        currentValue = currentMeeting.attendees;
+        previousValue = previousMeeting.attendees;
+        break;
+      case 'STATUS':
+        currentValue = currentMeeting.status;
+        previousValue = previousMeeting.status;
+        break;
+      case 'DATETIME':
+        currentValue = formatMeetingDateTime(currentMeeting.datetime);
+        previousValue = formatMeetingDateTime(previousMeeting.datetime);
+        break;
+      case 'AGENDA':
+        currentValue = currentMeeting.agenda;
+        previousValue = previousMeeting.agenda;
+        break;
+      case 'DOCUMENTATION':
+        currentValue = currentMeeting.documentation;
+        previousValue = previousMeeting.documentation;
+        break;
+    }
+
+    // Normalize for comparison
+    const currentNorm = String(currentValue || '').trim();
+    const previousNorm = String(previousValue || '').trim();
+
+    if (currentNorm !== previousNorm) {
+      fieldChanges.push({
+        field: fieldKey,
+        fieldName: CONFIG.MEETINGS.FIELD_NAMES[fieldKey],
+        oldValue: previousValue || '(empty)',
+        newValue: currentValue || '(empty)'
+      });
+    }
+  });
+
+  return fieldChanges;
+}
+
 
 
 // ================================================================================
@@ -624,8 +1085,19 @@ function buildEmailBody(assigneeEmail, newTasks, changedTasks, deletedTasks, spr
       if (task.notes) {
         body += `  Notas: ${task.notes}\n`;
       }
-      body += `  \n`;
-      body += `  → Esta tarea fue asignada recientemente a ti\n\n`;
+      // Show all assignees if multiple
+      if (task.assignees) {
+        body += `  Asignado a: ${task.assignees}\n`;
+        const assigneeCount = parseMultipleEmails(task.assignees).length;
+        if (assigneeCount > 1) {
+          body += `  → Esta tarea fue asignada a ti y ${assigneeCount - 1} colaborador(es) más\n`;
+        } else {
+          body += `  → Esta tarea fue asignada recientemente a ti\n`;
+        }
+      } else {
+        body += `  → Esta tarea fue asignada recientemente a ti\n`;
+      }
+      body += `\n`;
       body += `───────────────────────────────────────────────────────\n\n`;
     });
   }
@@ -680,6 +1152,10 @@ function buildEmailBody(assigneeEmail, newTasks, changedTasks, deletedTasks, spr
       if (!changes.find(c => c.field === 'NOTES') && task.notes) {
         body += `  Notas: ${task.notes}\n`;
       }
+      // Show all assignees
+      if (!changes.find(c => c.field === 'EMAIL') && task.assignees) {
+        body += `  Asignado a: ${task.assignees}\n`;
+      }
 
       body += `  \n`;
       body += `  → ${changes.length} cambios desde la última notificación\n\n`;
@@ -695,6 +1171,9 @@ function buildEmailBody(assigneeEmail, newTasks, changedTasks, deletedTasks, spr
       body += `  Prioridad: ${task.priority}\n`;
       body += `  Estado: ${task.status}\n`;
       body += `  Producto: ${task.product}\n`;
+      if (task.assignees) {
+        body += `  Asignado a: ${task.assignees}\n`;
+      }
       if (task.notes) {
         body += `  Notas: ${task.notes}\n`;
       }
@@ -713,6 +1192,209 @@ function buildEmailBody(assigneeEmail, newTasks, changedTasks, deletedTasks, spr
   return body;
 }
 
+/**
+ * Sends consolidated email notifications to attendees with changed meetings
+ * @param {Object} changes - Detected changes
+ * @param {string} spreadsheetUrl - URL of the spreadsheet
+ * @returns {Object} Notification statistics
+ */
+function sendMeetingNotifications(changes, spreadsheetUrl) {
+  const meetingsByAttendee = groupMeetingsByAttendee(changes);
+  let emailsSent = 0;
+
+  meetingsByAttendee.forEach((meetings, email) => {
+    try {
+      const emailBody = buildMeetingEmailBody(
+        email,
+        meetings.new,
+        meetings.changed,
+        meetings.deleted,
+        spreadsheetUrl
+      );
+
+      MailApp.sendEmail({
+        to: email,
+        subject: CONFIG.MEETINGS.EMAIL_SUBJECT,
+        body: emailBody
+      });
+
+      emailsSent++;
+      Logger.log(`Meeting notification email sent to: ${email}`);
+
+    } catch (error) {
+      Logger.log(`Failed to send meeting email to ${email}: ${error.toString()}`);
+    }
+  });
+
+  return { emailsSent: emailsSent };
+}
+
+/**
+ * Groups meetings by attendee email address
+ * @param {Object} changes - Detected changes
+ * @returns {Map} Map of email to categorized meetings
+ */
+function groupMeetingsByAttendee(changes) {
+  const meetingsByAttendee = new Map();
+
+  // Helper function to add meeting to attendee's list
+  const addToAttendee = (email, category, meeting) => {
+    if (!meetingsByAttendee.has(email)) {
+      meetingsByAttendee.set(email, { new: [], changed: [], deleted: [] });
+    }
+    meetingsByAttendee.get(email)[category].push(meeting);
+  };
+
+  // Add new meetings
+  changes.new.forEach(meeting => {
+    addToAttendee(meeting.email, 'new', meeting);
+  });
+
+  // Add changed meetings
+  changes.changed.forEach(changeObj => {
+    addToAttendee(changeObj.meeting.email, 'changed', changeObj);
+  });
+
+  // Add deleted meetings (use previous attendee)
+  changes.deleted.forEach(meeting => {
+    addToAttendee(meeting.email, 'deleted', meeting);
+  });
+
+  return meetingsByAttendee;
+}
+
+/**
+ * Builds plain text email body with meeting change details
+ * @param {string} attendeeEmail - Recipient email
+ * @param {Array} newMeetings - New meetings
+ * @param {Array} changedMeetings - Changed meetings with change details
+ * @param {Array} deletedMeetings - Deleted meetings
+ * @param {string} spreadsheetUrl - Spreadsheet URL
+ * @returns {string} Formatted email body
+ */
+function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, deletedMeetings, spreadsheetUrl) {
+  const totalChanges = newMeetings.length + changedMeetings.length + deletedMeetings.length;
+  let body = `Hola,\n\n`;
+  body += `Tienes ${totalChanges} reunión(es) programadas o actualizadas:\n\n`;
+  body += `═══════════════════════════════════════════════════════\n\n`;
+
+  // Section 1: New meetings
+  if (newMeetings.length > 0) {
+    newMeetings.forEach(meeting => {
+      body += `✨ NUEVA REUNIÓN PROGRAMADA\n\n`;
+      body += `📅 ${meeting.title}\n`;
+      body += `  Fecha y hora: ${formatMeetingDateTime(meeting.datetime)}\n`;
+      body += `  Estado: ${meeting.status}\n`;
+      body += `  Asistentes: ${meeting.attendees}\n`;
+      body += `\n`;
+      if (meeting.agenda) {
+        body += `  Agenda:\n`;
+        body += `  ${meeting.agenda}\n`;
+        body += `\n`;
+      }
+      if (meeting.documentation) {
+        body += `  📎 Documentación:\n`;
+        body += `  ${meeting.documentation}\n`;
+        body += `  (Asegúrate de tener acceso a los documentos compartidos)\n`;
+        body += `\n`;
+      }
+      body += `  → Esta reunión fue agendada recientemente\n\n`;
+      body += `───────────────────────────────────────────────────────\n\n`;
+    });
+  }
+
+  // Section 2: Changed meetings
+  if (changedMeetings.length > 0) {
+    changedMeetings.forEach(changeObj => {
+      const meeting = changeObj.meeting;
+      const changes = changeObj.changes;
+
+      body += `📝 REUNIÓN ACTUALIZADA\n\n`;
+      body += `📅 ${meeting.title}\n`;
+
+      // Show all fields, highlighting changed ones
+      changes.forEach(change => {
+        if (change.field === 'TITLE') {
+          body += `  (Título cambiado de: "${change.oldValue}")\n`;
+        } else if (change.field === 'DATETIME') {
+          body += `  Fecha y hora: ${change.oldValue} → ${change.newValue} ⚠️\n`;
+        } else if (change.field === 'STATUS') {
+          body += `  Estado: ${change.oldValue} → ${change.newValue} ✓\n`;
+        } else if (change.field === 'ATTENDEES') {
+          body += `  Asistentes actualizados: ${change.oldValue} → ${change.newValue}\n`;
+        } else if (change.field === 'AGENDA') {
+          body += `  Agenda actualizada\n`;
+        } else if (change.field === 'DOCUMENTATION') {
+          body += `  Documentación actualizada\n`;
+        }
+      });
+
+      // Show unchanged fields
+      if (!changes.find(c => c.field === 'DATETIME')) {
+        body += `  Fecha y hora: ${formatMeetingDateTime(meeting.datetime)}\n`;
+      }
+      if (!changes.find(c => c.field === 'STATUS')) {
+        body += `  Estado: ${meeting.status}\n`;
+      }
+      if (!changes.find(c => c.field === 'ATTENDEES')) {
+        body += `  Asistentes: ${meeting.attendees}\n`;
+      }
+
+      body += `\n`;
+      
+      if (!changes.find(c => c.field === 'AGENDA')) {
+        if (meeting.agenda) {
+          body += `  Agenda:\n`;
+          body += `  ${meeting.agenda}\n`;
+          body += `\n`;
+        }
+      } else {
+        body += `  Nueva agenda:\n`;
+        body += `  ${meeting.agenda || '(sin agenda)'}\n`;
+        body += `\n`;
+      }
+
+      if (meeting.documentation) {
+        if (changes.find(c => c.field === 'DOCUMENTATION')) {
+          body += `  📎 Documentación actualizada:\n`;
+        } else {
+          body += `  📎 Documentación:\n`;
+        }
+        body += `  ${meeting.documentation}\n`;
+        body += `\n`;
+      }
+
+      body += `  → ${changes.length} cambio(s) desde la última notificación\n\n`;
+      body += `───────────────────────────────────────────────────────\n\n`;
+    });
+  }
+
+  // Section 3: Deleted meetings
+  if (deletedMeetings.length > 0) {
+    deletedMeetings.forEach(meeting => {
+      body += `🗑️ REUNIÓN CANCELADA/ELIMINADA\n\n`;
+      body += `📅 ${meeting.title}\n`;
+      body += `  Fecha y hora: ${formatMeetingDateTime(meeting.datetime)}\n`;
+      body += `  Estado: ${meeting.status}\n`;
+      if (meeting.attendees) {
+        body += `  Asistentes: ${meeting.attendees}\n`;
+      }
+      body += `\n`;
+      body += `  → Esta reunión fue eliminada del calendario\n\n`;
+      body += `───────────────────────────────────────────────────────\n\n`;
+    });
+  }
+
+  body += `═══════════════════════════════════════════════════════\n\n`;
+  body += `Ver el calendario completo: ${spreadsheetUrl}\n\n`;
+  body += `Notificación enviada: ${formatDateTime(new Date())}\n\n`;
+  body += `---\n`;
+  body += `ℹ️ Estás recibiendo esto porque fuiste invitado a reunión(es) que cambiaron.\n`;
+
+  return body;
+}
+
+
 
 // ================================================================================
 // SECTION 8: UTILITY FUNCTIONS
@@ -727,6 +1409,27 @@ function isValidEmail(email) {
   if (!email) return false;
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   return emailRegex.test(email.toString().trim());
+}
+
+/**
+ * Parses multiple email addresses from a string
+ * Supports comma and semicolon separators
+ * @param {string} emailString - String containing one or more emails
+ * @returns {Array} Array of unique, valid email addresses
+ */
+function parseMultipleEmails(emailString) {
+  if (!emailString) return [];
+  
+  // Normalize: replace semicolons with commas
+  const normalized = emailString.toString().replace(/;/g, ',');
+  
+  // Split by commas, trim, lowercase, and filter valid emails
+  const emails = normalized.split(',')
+    .map(email => email.trim().toLowerCase())
+    .filter(email => email && isValidEmail(email));
+  
+  // Remove duplicates using Set
+  return [...new Set(emails)];
 }
 
 /**
@@ -775,6 +1478,37 @@ function formatDateTime(date) {
 
   return `${day}-${month}-${year} ${hours}:${minutes}`;
 }
+
+/**
+ * Formats meeting date-time for display in emails
+ * @param {Date|string} datetimeValue - Datetime value from Google Sheets
+ * @returns {string} Formatted datetime string "dd-mm-yyyy HH:mm"
+ */
+function formatMeetingDateTime(datetimeValue) {
+  if (!datetimeValue) return '(no especificada)';
+  
+  try {
+    let date;
+    if (datetimeValue instanceof Date) {
+      date = datetimeValue;
+    } else if (typeof datetimeValue === 'string') {
+      date = new Date(datetimeValue);
+    } else {
+      return String(datetimeValue);
+    }
+    
+    if (isNaN(date.getTime())) {
+      return String(datetimeValue);
+    }
+    
+    // Reuse formatDateTime() for consistent formatting
+    return formatDateTime(date);
+    
+  } catch (error) {
+    return String(datetimeValue);
+  }
+}
+
 
 /**
  * Sanitizes cell values for safe handling
