@@ -16,10 +16,12 @@ This Google Apps Script automatically detects changes in your project management
 - **👥 Consolidated Emails** - One email per person with all their changes grouped together
 - **🔔 Deletion Notifications** - Alerts previous assignee when tasks are removed
 - **📅 Consistent Formatting** - All dates in dd-mm-yyyy format
+- **✉️ Multi-Assignee Tasks** - Assign tasks to multiple people using comma or semicolon separators (e.g., `user1@x.com, user2@x.com`)
+- **📅 Meeting Notifications** - Separate "Reuniones" sheet with dedicated notification system for meetings
 
 ## 📋 Requirements
 
-### Spreadsheet Structure
+### Task Spreadsheet Structure
 
 Your spreadsheet should have the following columns (Row 1 = Headers, Row 2+ = Data):
 
@@ -27,13 +29,26 @@ Your spreadsheet should have the following columns (Row 1 = Headers, Row 2+ = Da
 |--------|-------|-------------|----------------------|
 | A | Task | Task name/description | ✅ Yes |
 | B | Priority | Task priority level | ✅ Yes |
-| C | Assignee | Email address of assignee | ✅ Yes |
+| C | Assignee | Email address(es) - supports multiple (comma/semicolon separated) | ✅ Yes |
 | D | Status | Current task status | ✅ Yes |
 | E | Init Date | Start date | ✅ Yes |
 | F | Finish Date | Due/completion date | ✅ Yes |
 | G | Hits | Number of updates/views | ❌ No (too frequent) |
 | H | Product | Related product/project | ✅ Yes |
 | I | Notes | Additional notes | ✅ Yes |
+
+### Meeting Spreadsheet Structure (Optional)
+
+To enable meeting notifications, create a sheet named "Reuniones" with these columns:
+
+| Column | Field | Description | Monitored for Changes |
+|--------|-------|-------------|----------------------|
+| A | Título | Meeting title | ✅ Yes |
+| B | Asistentes | Attendee emails - supports multiple (comma/semicolon separated) | ✅ Yes |
+| C | Estado | Meeting status (use dropdown: Programada, Completada, Cancelada, Pospuesta) | ✅ Yes |
+| D | Fecha_hora | Meeting date and time (use Google Sheets Date time format) | ✅ Yes |
+| E | Agenda | Meeting agenda/topics | ✅ Yes |
+| F | Documentación | Google Drive URLs or notes | ✅ Yes |
 
 ## 🚀 Quick Start
 
@@ -44,20 +59,24 @@ Your spreadsheet should have the following columns (Row 1 = Headers, Row 2+ = Da
 5. Save the project (name it "Task Notification System")
 6. Close Apps Script and refresh your spreadsheet
 7. You'll see a new menu: **📧 Notifications**
-8. Click **📧 Notifications → Notify task assignees**
+8. Choose:
+   - **📧 Notifications → Notify task assignees** - For task notifications
+   - **📧 Notifications → Notify meeting attendees** - For meeting notifications (requires "Reuniones" sheet)
 9. Authorize the script when prompted (first time only)
 
 For detailed instructions, see [DEPLOYMENT_INSTRUCTIONS.md](./DEPLOYMENT_INSTRUCTIONS.md)
 
 ## 📧 How It Works
 
-### First Run (Transparency)
+### Task Notifications
+
+#### First Run (Transparency)
 - Creates "Task History" sheet automatically
 - Treats all tasks as "new"
 - Sends notifications to ALL assignees with their current assignments
 - Saves initial snapshot for future comparisons
 
-### Subsequent Runs (Granular)
+#### Subsequent Runs (Granular)
 1. Scans all sheets for tasks
 2. Compares with previous snapshot from History sheet
 3. Detects changes:
@@ -69,6 +88,22 @@ For detailed instructions, see [DEPLOYMENT_INSTRUCTIONS.md](./DEPLOYMENT_INSTRUC
 5. Sends ONE consolidated email per person (only if they have changes)
 6. Saves new snapshot to History sheet
 7. Shows summary alert with statistics
+
+### Meeting Notifications
+
+Works identically to task notifications but:
+- Uses the "Reuniones" sheet instead of task sheets
+- Creates a separate "_meetings_history" sheet
+- Sends meeting-specific email format
+- Triggered via "Notify meeting attendees" menu option
+
+### Multi-Assignee Support
+
+Both tasks and meetings support multiple email addresses:
+- Use comma (`,`) or semicolon (`;`) as separators
+- Example: `user1@example.com, user2@example.com; user3@example.com`
+- Each person receives individual notifications
+- Email body shows all assignees/attendees for collaboration context
 
 ## 📨 Email Format Example
 
@@ -216,9 +251,19 @@ Possible additions (not currently implemented):
 
 ## 📝 Version
 
-- **Version:** 1.0
-- **Last Updated:** February 2026
+- **Version:** 2.0
+- **Last Updated:** March 2026
 - **Compatibility:** Google Apps Script (Google Sheets)
+
+### Changelog
+
+**v2.0** (March 2026)
+- Added multi-assignee support for tasks (comma/semicolon separated emails)
+- Added meeting notification system with separate "Reuniones" sheet
+- Added independent history tracking for meetings (_meetings_history)
+
+**v1.0** (February 2026)
+- Initial release with task notification system
 
 ## 📄 License
 
