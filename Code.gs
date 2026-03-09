@@ -20,6 +20,8 @@
  */
 
 
+
+
 // ================================================================================
 // SECTION 1: CONFIGURATION
 // ================================================================================
@@ -91,13 +93,13 @@ const CONFIG = {
   // ================================================================================
   // MEETINGS CONFIGURATION
   // ================================================================================
-  
+
   MEETINGS: {
     SHEET_NAME: 'Reuniones',
     HISTORY_SHEET_NAME: '_meetings_history',
     EMAIL_SUBJECT: 'Reunión de equipo - convocatoria',
     MENU_ITEM: 'Notificar reuniones',
-    
+
     COLUMNS: {
       TITLE: 0,         // Columna A
       ATTENDEES: 1,     // Columna B
@@ -106,27 +108,27 @@ const CONFIG = {
       AGENDA: 4,        // Columna E
       DOCUMENTATION: 5  // Columna F
     },
-    
+
     HEADER_ROW: 1,
     FIRST_DATA_ROW: 2,
-    
+
     MONITORED_FIELDS: ['TITLE', 'ATTENDEES', 'STATUS', 'DATETIME', 'AGENDA', 'DOCUMENTATION'],
-    
+
     FIELD_NAMES: {
-      TITLE: 'Reunión',
+      TITLE: 'Título',
       ATTENDEES: 'Asistentes',
       STATUS: 'Estado',
       DATETIME: 'Fecha y hora',
       AGENDA: 'Agenda',
       DOCUMENTATION: 'Documentación'
     },
-    
+
     HISTORY_HEADERS: [
       'Timestamp', 'ID Reunión', 'Título', 'Asistentes',
       'Estado', 'Fecha_hora', 'Agenda', 'Documentación',
       'Acción', 'Notificado'
     ],
-    
+
     ALERTS: {
       NO_MEETINGS: 'No se encontraron reuniones en la hoja. Por favor, agregue reuniones primero.',
       SUMMARY_TITLE: '✓ Resumen de notificaciones de reuniones',
@@ -503,7 +505,7 @@ function getPreviousSnapshot() {
     const row = data[i];
     const taskId = row[2]; // Task ID column
     const email = row[5]; // Email column
-    
+
     // Create unique key combining taskId and email
     const key = `${taskId}|${email}`;
 
@@ -649,7 +651,7 @@ function getPreviousMeetingsSnapshot() {
     const row = data[i];
     const meetingId = row[1]; // Meeting ID column
     const email = row[3]; // Attendees column (we'll extract individual email)
-    
+
     // Create unique key combining meetingId and email
     const key = `${meetingId}|${email}`;
 
@@ -1231,6 +1233,7 @@ function sendMeetingNotifications(changes, spreadsheetUrl) {
 
 /**
  * Groups meetings by attendee email address
+ * Filters out meetings with status "Completada" (finished meetings don't need notifications)
  * @param {Object} changes - Detected changes
  * @returns {Map} Map of email to categorized meetings
  */
@@ -1245,14 +1248,18 @@ function groupMeetingsByAttendee(changes) {
     meetingsByAttendee.get(email)[category].push(meeting);
   };
 
-  // Add new meetings
+  // Add new meetings (skip completed ones)
   changes.new.forEach(meeting => {
-    addToAttendee(meeting.email, 'new', meeting);
+    if (meeting.status !== 'Completada') {
+      addToAttendee(meeting.email, 'new', meeting);
+    }
   });
 
-  // Add changed meetings
+  // Add changed meetings (skip completed ones)
   changes.changed.forEach(changeObj => {
-    addToAttendee(changeObj.meeting.email, 'changed', changeObj);
+    if (changeObj.meeting.status !== 'Completada') {
+      addToAttendee(changeObj.meeting.email, 'changed', changeObj);
+    }
   });
 
   // Add deleted meetings (use previous attendee)
@@ -1321,7 +1328,7 @@ function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, dele
         } else if (change.field === 'STATUS') {
           body += `  Estado: ${change.oldValue} → ${change.newValue} ✓\n`;
         } else if (change.field === 'ATTENDEES') {
-          body += `  Asistentes actualizados: ${change.oldValue} → ${change.newValue}\n`;
+          body += `  Asistentes actualizados: ${change.newValue}\n`;// ${change.oldValue} → ${change.newValue}\n`;
         } else if (change.field === 'AGENDA') {
           body += `  Agenda actualizada\n`;
         } else if (change.field === 'DOCUMENTATION') {
@@ -1341,7 +1348,7 @@ function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, dele
       }
 
       body += `\n`;
-      
+
       if (!changes.find(c => c.field === 'AGENDA')) {
         if (meeting.agenda) {
           body += `  Agenda:\n`;
@@ -1375,7 +1382,7 @@ function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, dele
       body += `🗑️ REUNIÓN CANCELADA/ELIMINADA\n\n`;
       body += `📅 ${meeting.title}\n`;
       body += `  Fecha y hora: ${formatMeetingDateTime(meeting.datetime)}\n`;
-      body += `  Estado: ${meeting.status}\n`;
+      // body += `  Estado: ${meeting.status}\n`;
       if (meeting.attendees) {
         body += `  Asistentes: ${meeting.attendees}\n`;
       }
@@ -1419,15 +1426,15 @@ function isValidEmail(email) {
  */
 function parseMultipleEmails(emailString) {
   if (!emailString) return [];
-  
+
   // Normalize: replace semicolons with commas
   const normalized = emailString.toString().replace(/;/g, ',');
-  
+
   // Split by commas, trim, lowercase, and filter valid emails
   const emails = normalized.split(',')
     .map(email => email.trim().toLowerCase())
     .filter(email => email && isValidEmail(email));
-  
+
   // Remove duplicates using Set
   return [...new Set(emails)];
 }
@@ -1486,7 +1493,7 @@ function formatDateTime(date) {
  */
 function formatMeetingDateTime(datetimeValue) {
   if (!datetimeValue) return '(no especificada)';
-  
+
   try {
     let date;
     if (datetimeValue instanceof Date) {
@@ -1496,14 +1503,14 @@ function formatMeetingDateTime(datetimeValue) {
     } else {
       return String(datetimeValue);
     }
-    
+
     if (isNaN(date.getTime())) {
       return String(datetimeValue);
     }
-    
+
     // Reuse formatDateTime() for consistent formatting
     return formatDateTime(date);
-    
+
   } catch (error) {
     return String(datetimeValue);
   }
