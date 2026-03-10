@@ -390,12 +390,14 @@ function getMeetingFromRow(sheet, row, rowIndex) {
     return null;
   }
 
+  const title = sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.TITLE]) || 'Reunión'
+
   // Create one meeting object per attendee
   return emailList.map(email => ({
-    meetingId: generateMeetingId(sheet.getName(), rowIndex),
+    meetingId: generateMeetingId(sheet.getName(), rowIndex, title),
     sheetName: sheet.getName(),
     rowNumber: rowIndex,
-    title: sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.TITLE]),
+    title: title,
     attendees: attendeesString.toString().trim(), // Keep full list for display
     email: email, // Individual email for routing
     status: sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.STATUS]),
@@ -406,13 +408,14 @@ function getMeetingFromRow(sheet, row, rowIndex) {
 }
 
 /**
- * Generates unique meeting ID from sheet name and row number
+ * Generates unique meeting ID from sheet name, row number, and title
  * @param {string} sheetName - Name of the sheet
  * @param {number} rowIndex - Row number
+ * @param {string} title - Title of the meeting
  * @returns {string} Unique meeting ID
  */
-function generateMeetingId(sheetName, rowIndex) {
-  return `${sheetName}_Row${rowIndex}`;
+function generateMeetingId(sheetName, rowIndex, title) {
+  return `${sheetName}_Row${rowIndex}_${title.substring(0, 20).replace(/\s+/g, '_')}`;
 }
 
 
@@ -441,7 +444,7 @@ function getTaskFromRow(sheet, row, rowIndex) {
 
   // Create one task object per assignee
   return emailList.map(email => ({
-    taskId: generateTaskId(sheet.getName(), rowIndex),
+    taskId: generateTaskId(sheet.getName(), rowIndex, sanitizeValue(row[CONFIG.COLUMNS.TASK])),
     sheetName: sheet.getName(),
     rowNumber: rowIndex,
     task: sanitizeValue(row[CONFIG.COLUMNS.TASK]),
@@ -548,21 +551,22 @@ function saveSnapshot(tasks, changes) {
   const timestamp = formatDateTime(new Date());
   const rows = [];
 
-  // Create a set of notified task IDs
-  const notifiedIds = new Set();
-  changes.new.forEach(t => notifiedIds.add(t.taskId));
-  changes.changed.forEach(t => notifiedIds.add(t.task.taskId));
+  // Create a set of notified task keys (taskId + email)
+  const notifiedKeys = new Set();
+  changes.new.forEach(t => notifiedKeys.add(`${t.taskId}|${t.email}`));
+  changes.changed.forEach(t => notifiedKeys.add(`${t.task.taskId}|${t.task.email}`));
 
   // Add current state of all tasks
   tasks.forEach(task => {
+    const currentKey = `${task.taskId}|${task.email}`;
     let action = 'UNCHANGED';
-    if (changes.new.find(t => t.taskId === task.taskId)) {
+    if (changes.new.find(t => `${t.taskId}|${t.email}` === currentKey)) {
       action = 'NEW';
-    } else if (changes.changed.find(t => t.task.taskId === task.taskId)) {
+    } else if (changes.changed.find(t => `${t.task.taskId}|${t.task.email}` === currentKey)) {
       action = 'CHANGED';
     }
 
-    const notified = notifiedIds.has(task.taskId) ? 'YES' : 'NO';
+    const notified = notifiedKeys.has(currentKey) ? 'YES' : 'NO';
 
     rows.push([
       timestamp,
@@ -650,7 +654,7 @@ function getPreviousMeetingsSnapshot() {
   for (let i = data.length - 1; i >= 0; i--) {
     const row = data[i];
     const meetingId = row[1]; // Meeting ID column
-    const email = row[3]; // Attendees column (we'll extract individual email)
+    const email = row[3]; // Individual attendee email column
 
     // Create unique key combining meetingId and email
     const key = `${meetingId}|${email}`;
@@ -690,21 +694,22 @@ function saveMeetingsSnapshot(meetings, changes) {
   const timestamp = formatDateTime(new Date());
   const rows = [];
 
-  // Create a set of notified meeting IDs
-  const notifiedIds = new Set();
-  changes.new.forEach(m => notifiedIds.add(m.meetingId));
-  changes.changed.forEach(m => notifiedIds.add(m.meeting.meetingId));
+  // Create a set of notified meeting keys (meetingId + email)
+  const notifiedKeys = new Set();
+  changes.new.forEach(m => notifiedKeys.add(`${m.meetingId}|${m.email}`));
+  changes.changed.forEach(m => notifiedKeys.add(`${m.meeting.meetingId}|${m.meeting.email}`));
 
   // Add current state of all meetings
   meetings.forEach(meeting => {
+    const currentKey = `${meeting.meetingId}|${meeting.email}`;
     let action = 'UNCHANGED';
-    if (changes.new.find(m => m.meetingId === meeting.meetingId)) {
+    if (changes.new.find(m => `${m.meetingId}|${m.email}` === currentKey)) {
       action = 'NEW';
-    } else if (changes.changed.find(m => m.meeting.meetingId === meeting.meetingId)) {
+    } else if (changes.changed.find(m => `${m.meeting.meetingId}|${m.meeting.email}` === currentKey)) {
       action = 'CHANGED';
     }
 
-    const notified = notifiedIds.has(meeting.meetingId) ? 'YES' : 'NO';
+    const notified = notifiedKeys.has(currentKey) ? 'YES' : 'NO';
 
     rows.push([
       timestamp,
@@ -763,35 +768,66 @@ function compareSnapshots(currentTasks, previousSnapshot) {
   };
 
   const currentKeys = new Set();
+  const matchedPreviousKeys = new Set();
+
+  // Candidate lookup by email for fallback matching when row numbers changed.
+  const previousByEmail = new Map();
+  previousSnapshot.forEach((previousTask, key) => {
+    if (previousTask.action === 'DELETED') {
+      return;
+    }
+
+    if (!previousByEmail.has(previousTask.email)) {
+      previousByEmail.set(previousTask.email, []);
+    }
+
+    previousByEmail.get(previousTask.email).push({ key, task: previousTask, used: false });
+  });
 
   // Check each current task
   currentTasks.forEach(currentTask => {
-    const key = `${currentTask.taskId}|${currentTask.email}`;
-    currentKeys.add(key);
+    const directKey = `${currentTask.taskId}|${currentTask.email}`;
+    let resolvedKey = directKey;
+    let previousTask = previousSnapshot.get(directKey);
 
-    if (!previousSnapshot.has(key)) {
-      // New task (or new assignee to existing task)
-      changes.new.push(currentTask);
-    } else {
-      // Existing task+email - check for changes
-      const previousTask = previousSnapshot.get(key);
-      const fieldChanges = detectFieldChanges(currentTask, previousTask);
+    // Fallback reconciliation: same assignee + same content means row-move, not new task.
+    if (!previousTask) {
+      const candidates = previousByEmail.get(currentTask.email) || [];
+      const currentFingerprint = buildTaskFingerprint(currentTask);
+      const candidate = candidates.find(entry => !entry.used && buildTaskFingerprint(entry.task) === currentFingerprint);
 
-      if (fieldChanges.length > 0) {
-        changes.changed.push({
-          task: currentTask,
-          changes: fieldChanges,
-          previousTask: previousTask
-        });
-      } else {
-        changes.unchanged.push(currentTask);
+      if (candidate) {
+        previousTask = candidate.task;
+        candidate.used = true;
+        resolvedKey = candidate.key;
+        currentTask.taskId = previousTask.taskId;
       }
+    }
+
+    currentKeys.add(resolvedKey);
+
+    if (!previousTask) {
+      changes.new.push(currentTask);
+      return;
+    }
+
+    matchedPreviousKeys.add(resolvedKey);
+    const fieldChanges = detectFieldChanges(currentTask, previousTask);
+
+    if (fieldChanges.length > 0) {
+      changes.changed.push({
+        task: currentTask,
+        changes: fieldChanges,
+        previousTask: previousTask
+      });
+    } else {
+      changes.unchanged.push(currentTask);
     }
   });
 
   // Check for deleted tasks (or removed assignees)
   previousSnapshot.forEach((previousTask, key) => {
-    if (!currentKeys.has(key) && previousTask.action !== 'DELETED') {
+    if (!currentKeys.has(key) && !matchedPreviousKeys.has(key) && previousTask.action !== 'DELETED') {
       changes.deleted.push(previousTask);
     }
   });
@@ -848,8 +884,16 @@ function detectFieldChanges(currentTask, previousTask) {
     }
 
     // Normalize for comparison
-    const currentNorm = String(currentValue || '').trim();
-    const previousNorm = String(previousValue || '').trim();
+    let currentNorm;
+    let previousNorm;
+
+    if (fieldKey === 'INIT_DATE' || fieldKey === 'FINISH_DATE') {
+      currentNorm = normalizeDateForComparison(currentTask[fieldKey === 'INIT_DATE' ? 'initDate' : 'finishDate']);
+      previousNorm = normalizeDateForComparison(previousTask[fieldKey === 'INIT_DATE' ? 'initDate' : 'finishDate']);
+    } else {
+      currentNorm = normalizeStringForComparison(currentValue);
+      previousNorm = normalizeStringForComparison(previousValue);
+    }
 
     if (currentNorm !== previousNorm) {
       fieldChanges.push({
@@ -868,9 +912,11 @@ function detectFieldChanges(currentTask, previousTask) {
  * Generates unique task ID from sheet name and row number
  * @param {string} sheetName - Name of the sheet
  * @param {number} rowIndex - Row number
+ * @param {string} taskName - Task name (reserved for future ID strategy)
  * @returns {string} Unique task ID
  */
-function generateTaskId(sheetName, rowIndex) {
+function generateTaskId(sheetName, rowIndex, taskName) {
+  const _unused = taskName;
   return `${sheetName}_Row${rowIndex}`;
 }
 
@@ -889,35 +935,66 @@ function compareMeetingsSnapshots(currentMeetings, previousSnapshot) {
   };
 
   const currentKeys = new Set();
+  const matchedPreviousKeys = new Set();
+
+  // Candidate lookup by attendee for fallback matching when row numbers changed.
+  const previousByEmail = new Map();
+  previousSnapshot.forEach((previousMeeting, key) => {
+    if (previousMeeting.action === 'DELETED') {
+      return;
+    }
+
+    if (!previousByEmail.has(previousMeeting.email)) {
+      previousByEmail.set(previousMeeting.email, []);
+    }
+
+    previousByEmail.get(previousMeeting.email).push({ key, meeting: previousMeeting, used: false });
+  });
 
   // Check each current meeting
   currentMeetings.forEach(currentMeeting => {
-    const key = `${currentMeeting.meetingId}|${currentMeeting.email}`;
-    currentKeys.add(key);
+    const directKey = `${currentMeeting.meetingId}|${currentMeeting.email}`;
+    let resolvedKey = directKey;
+    let previousMeeting = previousSnapshot.get(directKey);
 
-    if (!previousSnapshot.has(key)) {
-      // New meeting (or new attendee to existing meeting)
-      changes.new.push(currentMeeting);
-    } else {
-      // Existing meeting+email - check for changes
-      const previousMeeting = previousSnapshot.get(key);
-      const fieldChanges = detectMeetingFieldChanges(currentMeeting, previousMeeting);
+    // Fallback reconciliation: same attendee + same content means row-move, not new meeting.
+    if (!previousMeeting) {
+      const candidates = previousByEmail.get(currentMeeting.email) || [];
+      const currentFingerprint = buildMeetingFingerprint(currentMeeting);
+      const candidate = candidates.find(entry => !entry.used && buildMeetingFingerprint(entry.meeting) === currentFingerprint);
 
-      if (fieldChanges.length > 0) {
-        changes.changed.push({
-          meeting: currentMeeting,
-          changes: fieldChanges,
-          previousMeeting: previousMeeting
-        });
-      } else {
-        changes.unchanged.push(currentMeeting);
+      if (candidate) {
+        previousMeeting = candidate.meeting;
+        candidate.used = true;
+        resolvedKey = candidate.key;
+        currentMeeting.meetingId = previousMeeting.meetingId;
       }
+    }
+
+    currentKeys.add(resolvedKey);
+
+    if (!previousMeeting) {
+      changes.new.push(currentMeeting);
+      return;
+    }
+
+    matchedPreviousKeys.add(resolvedKey);
+    const fieldChanges = detectMeetingFieldChanges(currentMeeting, previousMeeting);
+
+    if (fieldChanges.length > 0) {
+      changes.changed.push({
+        meeting: currentMeeting,
+        changes: fieldChanges,
+        previousMeeting: previousMeeting
+      });
+    } else {
+      changes.unchanged.push(currentMeeting);
     }
   });
 
   // Check for deleted meetings (or removed attendees)
   previousSnapshot.forEach((previousMeeting, key) => {
-    if (!currentKeys.has(key) && previousMeeting.action !== 'DELETED') {
+    if (!currentKeys.has(key) && !matchedPreviousKeys.has(key) && previousMeeting.action !== 'DELETED') {
       changes.deleted.push(previousMeeting);
     }
   });
@@ -943,10 +1020,24 @@ function detectMeetingFieldChanges(currentMeeting, previousMeeting) {
         currentValue = currentMeeting.title;
         previousValue = previousMeeting.title;
         break;
-      case 'ATTENDEES':
+      case 'ATTENDEES': {
         currentValue = currentMeeting.attendees;
         previousValue = previousMeeting.attendees;
+
+        // Ignore list churn for this attendee when they remain invited in both versions.
+        const currentEmails = parseMultipleEmails(currentMeeting.attendees);
+        const previousEmails = parseMultipleEmails(previousMeeting.attendees);
+        const attendeeEmail = currentMeeting.email || previousMeeting.email;
+
+        if (
+          attendeeEmail &&
+          currentEmails.includes(attendeeEmail) &&
+          previousEmails.includes(attendeeEmail)
+        ) {
+          return;
+        }
         break;
+      }
       case 'STATUS':
         currentValue = currentMeeting.status;
         previousValue = previousMeeting.status;
@@ -966,8 +1057,13 @@ function detectMeetingFieldChanges(currentMeeting, previousMeeting) {
     }
 
     // Normalize for comparison
-    const currentNorm = String(currentValue || '').trim();
-    const previousNorm = String(previousValue || '').trim();
+    const currentNorm = fieldKey === 'DATETIME'
+      ? normalizeDateTimeForComparison(currentMeeting.datetime)
+      : normalizeStringForComparison(currentValue);
+
+    const previousNorm = fieldKey === 'DATETIME'
+      ? normalizeDateTimeForComparison(previousMeeting.datetime)
+      : normalizeStringForComparison(previousValue);
 
     if (currentNorm !== previousNorm) {
       fieldChanges.push({
@@ -1514,6 +1610,102 @@ function formatMeetingDateTime(datetimeValue) {
   } catch (error) {
     return String(datetimeValue);
   }
+}
+
+/**
+ * Normalizes arbitrary values to comparable strings.
+ * @param {any} value - Any comparable value
+ * @returns {string} Normalized value for equality checks
+ */
+function normalizeStringForComparison(value) {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  return String(value).trim();
+}
+
+/**
+ * Normalizes date values to yyyy-mm-dd for stable comparisons.
+ * @param {Date|string} value - Date value from sheet/history
+ * @returns {string} Normalized date string or empty string
+ */
+function normalizeDateForComparison(value) {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  let date;
+  if (value instanceof Date) {
+    date = value;
+  } else {
+    date = new Date(value);
+  }
+
+  if (isNaN(date.getTime())) {
+    return normalizeStringForComparison(value);
+  }
+
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}
+
+/**
+ * Normalizes datetime values to yyyy-mm-dd HH:mm for stable comparisons.
+ * @param {Date|string} value - Datetime value from sheet/history
+ * @returns {string} Normalized datetime string or empty string
+ */
+function normalizeDateTimeForComparison(value) {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  let date;
+  if (value instanceof Date) {
+    date = value;
+  } else {
+    date = new Date(value);
+  }
+
+  if (isNaN(date.getTime())) {
+    return normalizeStringForComparison(value);
+  }
+
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+}
+
+/**
+ * Creates an order-independent fingerprint for task reconciliation.
+ * @param {Object} task - Task object
+ * @returns {string} Fingerprint
+ */
+function buildTaskFingerprint(task) {
+  return [
+    normalizeStringForComparison(task.sheetName),
+    normalizeStringForComparison(task.email),
+    normalizeStringForComparison(task.task),
+    normalizeStringForComparison(task.priority),
+    normalizeStringForComparison(task.status),
+    normalizeDateForComparison(task.initDate),
+    normalizeDateForComparison(task.finishDate),
+    normalizeStringForComparison(task.product),
+    normalizeStringForComparison(task.notes)
+  ].join('|');
+}
+
+/**
+ * Creates an order-independent fingerprint for meeting reconciliation.
+ * @param {Object} meeting - Meeting object
+ * @returns {string} Fingerprint
+ */
+function buildMeetingFingerprint(meeting) {
+  return [
+    normalizeStringForComparison(meeting.email),
+    normalizeStringForComparison(meeting.title),
+    normalizeDateTimeForComparison(meeting.datetime),
+    normalizeStringForComparison(meeting.status),
+    normalizeStringForComparison(meeting.agenda),
+    normalizeStringForComparison(meeting.documentation)
+  ].join('|');
 }
 
 
