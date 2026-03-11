@@ -48,7 +48,7 @@ const CONFIG = {
 
   // Spreadsheet UI
   SPREADSHEET_MENU_NAME: '📧 Notificaciones',
-  SPREADSHEET_MENU_ITEM: 'Notificar a los asignados',
+  SPREADSHEET_MENU_ITEM: 'Notificar tareas a los asignados',
 
   // Spreadsheet structure
   HEADER_ROW: 1,
@@ -87,7 +87,8 @@ const CONFIG = {
       `• ${deletedCount} tarea(s) eliminada(s)\n` +
       `• ${unchangedCount} tarea(s) sin cambios (no notificadas)\n\n` +
       `📧 Correos enviados a ${emailsSent} asignado(s)\n\n` +
-      `Snapshot guardado en la hoja ${CONFIG.HISTORY_SHEET_NAME}.`
+      `Snapshot guardado en la hoja ${CONFIG.HISTORY_SHEET_NAME}.`,
+    EMAIL_NOTIFICATION_FAILED: (email) => `Error al enviar correo a ${email}.`
   },
 
   // ================================================================================
@@ -99,26 +100,29 @@ const CONFIG = {
     HISTORY_SHEET_NAME: '_meetings_history',
     EMAIL_SUBJECT: 'Reunión de equipo - convocatoria',
     MENU_ITEM: 'Notificar reuniones',
+    COMPLETED_STATUS: 'Completada',
 
     COLUMNS: {
       TITLE: 0,         // Columna A
       ATTENDEES: 1,     // Columna B
       STATUS: 2,        // Columna C
-      DATETIME: 3,      // Columna D
-      AGENDA: 4,        // Columna E
-      DOCUMENTATION: 5  // Columna F
+      DATE: 3,          // Columna D (Fecha)
+      TIME: 4,          // Columna E (Hora)
+      AGENDA: 5,        // Columna F
+      DOCUMENTATION: 6  // Columna G
     },
 
     HEADER_ROW: 1,
     FIRST_DATA_ROW: 2,
 
-    MONITORED_FIELDS: ['TITLE', 'ATTENDEES', 'STATUS', 'DATETIME', 'AGENDA', 'DOCUMENTATION'],
+    MONITORED_FIELDS: ['TITLE', 'ATTENDEES', 'STATUS', 'DATE', 'TIME', 'AGENDA', 'DOCUMENTATION'],
 
     FIELD_NAMES: {
       TITLE: 'Título',
       ATTENDEES: 'Asistentes',
       STATUS: 'Estado',
-      DATETIME: 'Fecha y hora',
+      DATE: 'Fecha',
+      TIME: 'Hora',
       AGENDA: 'Agenda',
       DOCUMENTATION: 'Documentación'
     },
@@ -233,6 +237,13 @@ function notifyMeetingAttendees() {
     const startTime = new Date();
     const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
 
+    // Validate required Reuniones structure before processing.
+    const structureCheck = validateMeetingsSheetStructure(spreadsheet);
+    if (!structureCheck.isValid) {
+      SpreadsheetApp.getUi().alert(structureCheck.message);
+      return;
+    }
+
     // Step 1: Ensure Meetings History sheet exists
     createMeetingsHistorySheet();
 
@@ -296,8 +307,12 @@ function getAllTasks() {
   const allTasks = [];
 
   sheets.forEach(sheet => {
-    // Skip the History sheet
-    if (sheet.getName() === CONFIG.HISTORY_SHEET_NAME) {
+    // Skip History and Meetings sheets
+    if (
+      sheet.getName() === CONFIG.HISTORY_SHEET_NAME
+      || sheet.getName() === CONFIG.MEETINGS.HISTORY_SHEET_NAME
+      || sheet.getName() === CONFIG.MEETINGS.SHEET_NAME
+    ) {
       return;
     }
 
@@ -349,8 +364,8 @@ function getAllMeetings() {
     return allMeetings;
   }
 
-  // Get all data rows (skip header)
-  const dataRange = sheet.getRange(CONFIG.MEETINGS.FIRST_DATA_ROW, 1, lastRow - CONFIG.MEETINGS.HEADER_ROW, 6);
+  // Get all data rows (skip header) using the strict split format: Fecha (D) + Hora (E)
+  const dataRange = sheet.getRange(CONFIG.MEETINGS.FIRST_DATA_ROW, 1, lastRow - CONFIG.MEETINGS.HEADER_ROW, 7);
   const data = dataRange.getValues();
 
   data.forEach((row, index) => {
@@ -365,6 +380,52 @@ function getAllMeetings() {
   });
 
   return allMeetings;
+}
+
+/**
+ * Validates that Reuniones uses the required split Fecha/Hora structure.
+ * @param {Spreadsheet} spreadsheet - Active spreadsheet
+ * @returns {{isValid: boolean, message: string}} Validation result
+ */
+function validateMeetingsSheetStructure(spreadsheet) {
+  const sheet = spreadsheet.getSheetByName(CONFIG.MEETINGS.SHEET_NAME);
+
+  if (!sheet) {
+    return {
+      isValid: false,
+      message: `No se encontró la hoja "${CONFIG.MEETINGS.SHEET_NAME}".`
+    };
+  }
+
+  // if (sheet.getLastColumn() < 7) {
+  //   return {
+  //     isValid: false,
+  //     message:
+  //       'La hoja Reuniones requiere 7 columnas en este orden: ' +
+  //       'Título, Asistentes, Estado, Fecha, Hora, Agenda, Documentación.'
+  //   };
+  // }
+
+  const headers = sheet.getRange(CONFIG.MEETINGS.HEADER_ROW, 1, 1, 7).getValues()[0]
+    .map(value => normalizeStringForComparison(value).toLowerCase());
+
+  const expectedHeaders = ['titulo', 'asistentes', 'estado', 'fecha', 'hora', 'agenda', 'documentacion'];
+
+  const headersMatch = expectedHeaders.every((expected, index) => {
+    const actual = removeDiacritics(headers[index]);
+    return actual === expected;
+  });
+
+  if (!headersMatch) {
+    return {
+      isValid: false,
+      message:
+        'Los encabezados de Reuniones no cumplen el formato requerido. ' +
+        'Use exactamente: Título, Asistentes, Estado, Fecha, Hora, Agenda, Documentación.'
+    };
+  }
+
+  return { isValid: true, message: '' };
 }
 
 /**
@@ -390,7 +451,8 @@ function getMeetingFromRow(sheet, row, rowIndex) {
     return null;
   }
 
-  const title = sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.TITLE]) || 'Reunión'
+  const title = sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.TITLE]) || 'Reunión';
+  const dateTimeParts = extractMeetingDateTimeParts(row);
 
   // Create one meeting object per attendee
   return emailList.map(email => ({
@@ -401,9 +463,11 @@ function getMeetingFromRow(sheet, row, rowIndex) {
     attendees: attendeesString.toString().trim(), // Keep full list for display
     email: email, // Individual email for routing
     status: sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.STATUS]),
-    datetime: row[CONFIG.MEETINGS.COLUMNS.DATETIME], // Date object from Google Sheets
-    agenda: sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.AGENDA]),
-    documentation: sanitizeValue(row[CONFIG.MEETINGS.COLUMNS.DOCUMENTATION])
+    datetime: dateTimeParts.datetime,
+    date: dateTimeParts.date,
+    time: dateTimeParts.time,
+    agenda: sanitizeValue(dateTimeParts.agenda),
+    documentation: sanitizeValue(dateTimeParts.documentation)
   }));
 }
 
@@ -444,7 +508,7 @@ function getTaskFromRow(sheet, row, rowIndex) {
 
   // Create one task object per assignee
   return emailList.map(email => ({
-    taskId: generateTaskId(sheet.getName(), rowIndex, sanitizeValue(row[CONFIG.COLUMNS.TASK])),
+    taskId: generateTaskId(sheet.getName(), rowIndex),
     sheetName: sheet.getName(),
     rowNumber: rowIndex,
     task: sanitizeValue(row[CONFIG.COLUMNS.TASK]),
@@ -668,6 +732,8 @@ function getPreviousMeetingsSnapshot() {
         email: email,
         status: row[4],
         datetime: row[5],
+        date: row[5],
+        time: row[5],
         agenda: row[6],
         documentation: row[7],
         action: row[8]
@@ -912,11 +978,9 @@ function detectFieldChanges(currentTask, previousTask) {
  * Generates unique task ID from sheet name and row number
  * @param {string} sheetName - Name of the sheet
  * @param {number} rowIndex - Row number
- * @param {string} taskName - Task name (reserved for future ID strategy)
  * @returns {string} Unique task ID
  */
-function generateTaskId(sheetName, rowIndex, taskName) {
-  const _unused = taskName;
+function generateTaskId(sheetName, rowIndex) {
   return `${sheetName}_Row${rowIndex}`;
 }
 
@@ -1042,9 +1106,13 @@ function detectMeetingFieldChanges(currentMeeting, previousMeeting) {
         currentValue = currentMeeting.status;
         previousValue = previousMeeting.status;
         break;
-      case 'DATETIME':
-        currentValue = formatMeetingDateTime(currentMeeting.datetime);
-        previousValue = formatMeetingDateTime(previousMeeting.datetime);
+      case 'DATE':
+        currentValue = formatDate(currentMeeting.date || currentMeeting.datetime);
+        previousValue = formatDate(previousMeeting.date || previousMeeting.datetime);
+        break;
+      case 'TIME':
+        currentValue = formatTime(currentMeeting.time || currentMeeting.datetime);
+        previousValue = formatTime(previousMeeting.time || previousMeeting.datetime);
         break;
       case 'AGENDA':
         currentValue = currentMeeting.agenda;
@@ -1057,13 +1125,17 @@ function detectMeetingFieldChanges(currentMeeting, previousMeeting) {
     }
 
     // Normalize for comparison
-    const currentNorm = fieldKey === 'DATETIME'
-      ? normalizeDateTimeForComparison(currentMeeting.datetime)
-      : normalizeStringForComparison(currentValue);
+    const currentNorm = fieldKey === 'DATE'
+      ? normalizeDateForComparison(currentMeeting.date || currentMeeting.datetime)
+      : fieldKey === 'TIME'
+        ? normalizeTimeForComparison(currentMeeting.time || currentMeeting.datetime)
+        : normalizeStringForComparison(currentValue);
 
-    const previousNorm = fieldKey === 'DATETIME'
-      ? normalizeDateTimeForComparison(previousMeeting.datetime)
-      : normalizeStringForComparison(previousValue);
+    const previousNorm = fieldKey === 'DATE'
+      ? normalizeDateForComparison(previousMeeting.date || previousMeeting.datetime)
+      : fieldKey === 'TIME'
+        ? normalizeTimeForComparison(previousMeeting.time || previousMeeting.datetime)
+        : normalizeStringForComparison(previousValue);
 
     if (currentNorm !== previousNorm) {
       fieldChanges.push({
@@ -1115,6 +1187,7 @@ function sendChangeNotifications(changes, spreadsheetUrl) {
 
     } catch (error) {
       Logger.log(`Failed to send email to ${email}: ${error.toString()}`);
+      showUiAlertSafe(CONFIG.ALERTS.EMAIL_NOTIFICATION_FAILED(email));
     }
   });
 
@@ -1321,6 +1394,7 @@ function sendMeetingNotifications(changes, spreadsheetUrl) {
 
     } catch (error) {
       Logger.log(`Failed to send meeting email to ${email}: ${error.toString()}`);
+      showUiAlertSafe(CONFIG.ALERTS.EMAIL_NOTIFICATION_FAILED(email));
     }
   });
 
@@ -1346,14 +1420,14 @@ function groupMeetingsByAttendee(changes) {
 
   // Add new meetings (skip completed ones)
   changes.new.forEach(meeting => {
-    if (meeting.status !== 'Completada') {
+    if (meeting.status !== CONFIG.MEETINGS.COMPLETED_STATUS) {
       addToAttendee(meeting.email, 'new', meeting);
     }
   });
 
   // Add changed meetings (skip completed ones)
   changes.changed.forEach(changeObj => {
-    if (changeObj.meeting.status !== 'Completada') {
+    if (changeObj.meeting.status !== CONFIG.MEETINGS.COMPLETED_STATUS) {
       addToAttendee(changeObj.meeting.email, 'changed', changeObj);
     }
   });
@@ -1419,8 +1493,10 @@ function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, dele
       changes.forEach(change => {
         if (change.field === 'TITLE') {
           body += `  (Título cambiado de: "${change.oldValue}")\n`;
-        } else if (change.field === 'DATETIME') {
-          body += `  Fecha y hora: ${change.oldValue} → ${change.newValue} ⚠️\n`;
+        } else if (change.field === 'DATE') {
+          body += `  Fecha: ${change.oldValue} → ${change.newValue} ⚠️\n`;
+        } else if (change.field === 'TIME') {
+          body += `  Hora: ${change.oldValue} → ${change.newValue} ⚠️\n`;
         } else if (change.field === 'STATUS') {
           body += `  Estado: ${change.oldValue} → ${change.newValue} ✓\n`;
         } else if (change.field === 'ATTENDEES') {
@@ -1433,7 +1509,7 @@ function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, dele
       });
 
       // Show unchanged fields
-      if (!changes.find(c => c.field === 'DATETIME')) {
+      if (!changes.find(c => c.field === 'DATE') && !changes.find(c => c.field === 'TIME')) {
         body += `  Fecha y hora: ${formatMeetingDateTime(meeting.datetime)}\n`;
       }
       if (!changes.find(c => c.field === 'STATUS')) {
@@ -1583,6 +1659,38 @@ function formatDateTime(date) {
 }
 
 /**
+ * Formats time value to HH:mm string.
+ * @param {Date|string} timeValue - Time value to format
+ * @returns {string} Formatted time string
+ */
+function formatTime(timeValue) {
+  if (!timeValue) return '';
+
+  try {
+    const parsed = parseLocalizedDateOrDateTime(timeValue);
+    if (parsed) {
+      return Utilities.formatDate(parsed, Session.getScriptTimeZone(), 'HH:mm');
+    }
+
+    if (timeValue instanceof Date) {
+      return Utilities.formatDate(timeValue, Session.getScriptTimeZone(), 'HH:mm');
+    }
+
+    const raw = String(timeValue).trim();
+    const hhmmMatch = raw.match(/^(\d{1,2}):(\d{2})$/);
+    if (hhmmMatch) {
+      const hh = hhmmMatch[1].padStart(2, '0');
+      const mm = hhmmMatch[2];
+      return `${hh}:${mm}`;
+    }
+
+    return raw;
+  } catch (error) {
+    return String(timeValue);
+  }
+}
+
+/**
  * Formats meeting date-time for display in emails
  * @param {Date|string} datetimeValue - Datetime value from Google Sheets
  * @returns {string} Formatted datetime string "dd-mm-yyyy HH:mm"
@@ -1613,6 +1721,67 @@ function formatMeetingDateTime(datetimeValue) {
 }
 
 /**
+ * Parses localized date strings (dd-mm-yyyy or dd-mm-yyyy HH:mm) safely.
+ * @param {Date|string} value - Date-like value
+ * @returns {Date|null} Parsed date or null if not parseable
+ */
+function parseLocalizedDateOrDateTime(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    return isNaN(value.getTime()) ? null : value;
+  }
+
+  const raw = String(value).trim();
+
+  // dd-mm-yyyy HH:mm
+  const dateTimeMatch = raw.match(/^(\d{1,2})-(\d{1,2})-(\d{4})\s+(\d{1,2}):(\d{2})$/);
+  if (dateTimeMatch) {
+    const day = Number(dateTimeMatch[1]);
+    const month = Number(dateTimeMatch[2]);
+    const year = Number(dateTimeMatch[3]);
+    const hour = Number(dateTimeMatch[4]);
+    const minute = Number(dateTimeMatch[5]);
+    const parsed = new Date(year, month - 1, day, hour, minute, 0, 0);
+
+    if (
+      parsed.getFullYear() === year &&
+      parsed.getMonth() === month - 1 &&
+      parsed.getDate() === day &&
+      parsed.getHours() === hour &&
+      parsed.getMinutes() === minute
+    ) {
+      return parsed;
+    }
+    return null;
+  }
+
+  // dd-mm-yyyy
+  const dateMatch = raw.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+  if (dateMatch) {
+    const day = Number(dateMatch[1]);
+    const month = Number(dateMatch[2]);
+    const year = Number(dateMatch[3]);
+    const parsed = new Date(year, month - 1, day, 0, 0, 0, 0);
+
+    if (
+      parsed.getFullYear() === year &&
+      parsed.getMonth() === month - 1 &&
+      parsed.getDate() === day
+    ) {
+      return parsed;
+    }
+    return null;
+  }
+
+  // Final fallback for ISO or other parser-friendly values
+  const fallback = new Date(raw);
+  return isNaN(fallback.getTime()) ? null : fallback;
+}
+
+/**
  * Normalizes arbitrary values to comparable strings.
  * @param {any} value - Any comparable value
  * @returns {string} Normalized value for equality checks
@@ -1626,6 +1795,17 @@ function normalizeStringForComparison(value) {
 }
 
 /**
+ * Removes diacritics (accents) for robust header comparisons.
+ * @param {string} value - Input text
+ * @returns {string} Text without diacritics
+ */
+function removeDiacritics(value) {
+  return normalizeStringForComparison(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+/**
  * Normalizes date values to yyyy-mm-dd for stable comparisons.
  * @param {Date|string} value - Date value from sheet/history
  * @returns {string} Normalized date string or empty string
@@ -1635,14 +1815,9 @@ function normalizeDateForComparison(value) {
     return '';
   }
 
-  let date;
-  if (value instanceof Date) {
-    date = value;
-  } else {
-    date = new Date(value);
-  }
+  const date = parseLocalizedDateOrDateTime(value);
 
-  if (isNaN(date.getTime())) {
+  if (!date) {
     return normalizeStringForComparison(value);
   }
 
@@ -1659,18 +1834,95 @@ function normalizeDateTimeForComparison(value) {
     return '';
   }
 
-  let date;
-  if (value instanceof Date) {
-    date = value;
-  } else {
-    date = new Date(value);
-  }
+  const date = parseLocalizedDateOrDateTime(value);
 
-  if (isNaN(date.getTime())) {
+  if (!date) {
     return normalizeStringForComparison(value);
   }
 
   return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+}
+
+/**
+ * Normalizes time values to HH:mm for stable comparisons.
+ * @param {Date|string} value - Time value from sheet/history
+ * @returns {string} Normalized time string or empty string
+ */
+function normalizeTimeForComparison(value) {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  if (value instanceof Date) {
+    return Utilities.formatDate(value, Session.getScriptTimeZone(), 'HH:mm');
+  }
+
+  const parsed = parseLocalizedDateOrDateTime(value);
+  if (parsed) {
+    return Utilities.formatDate(parsed, Session.getScriptTimeZone(), 'HH:mm');
+  }
+
+  const raw = String(value).trim();
+  const hhmmMatch = raw.match(/^(\d{1,2}):(\d{2})$/);
+  if (hhmmMatch) {
+    return `${hhmmMatch[1].padStart(2, '0')}:${hhmmMatch[2]}`;
+  }
+
+  return raw;
+}
+
+/**
+ * Extracts meeting datetime/date/time from the split row format.
+ * @param {Array} row - Meeting row
+ * @returns {Object} Extracted meeting date-time fields and content columns
+ */
+function extractMeetingDateTimeParts(row) {
+  const date = row[CONFIG.MEETINGS.COLUMNS.DATE] || '';
+  const time = row[CONFIG.MEETINGS.COLUMNS.TIME] || '';
+
+  return {
+    datetime: buildDateTimeFromDateAndTime(date, time),
+    date: date,
+    time: time,
+    agenda: row[CONFIG.MEETINGS.COLUMNS.AGENDA],
+    documentation: row[CONFIG.MEETINGS.COLUMNS.DOCUMENTATION]
+  };
+}
+
+/**
+ * Combines separate date/time inputs into a Date when possible.
+ * @param {Date|string} dateValue - Date value
+ * @param {Date|string} timeValue - Time value
+ * @returns {Date|string} Date object when parseable; otherwise combined/raw string
+ */
+function buildDateTimeFromDateAndTime(dateValue, timeValue) {
+  const datePart = normalizeDateForComparison(dateValue);
+  const timePart = normalizeTimeForComparison(timeValue);
+
+  if (!datePart && !timePart) {
+    return '';
+  }
+
+  if (datePart && timePart) {
+    const match = datePart.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    const timeMatch = timePart.match(/^(\d{2}):(\d{2})$/);
+
+    if (match && timeMatch) {
+      return new Date(
+        Number(match[1]),
+        Number(match[2]) - 1,
+        Number(match[3]),
+        Number(timeMatch[1]),
+        Number(timeMatch[2]),
+        0,
+        0
+      );
+    }
+
+    return `${datePart} ${timePart}`;
+  }
+
+  return datePart || timePart;
 }
 
 /**
@@ -1719,4 +1971,16 @@ function sanitizeValue(value) {
     return '';
   }
   return String(value).trim();
+}
+
+/**
+ * Shows an alert when UI context is available; otherwise logs a fallback message.
+ * @param {string} message - Alert message
+ */
+function showUiAlertSafe(message) {
+  try {
+    SpreadsheetApp.getUi().alert(message);
+  } catch (error) {
+    Logger.log(`UI alert unavailable. Message: ${message}. Reason: ${error.toString()}`);
+  }
 }
