@@ -248,6 +248,7 @@ Use this checklist to verify everything works:
 - [ ] First run sends emails to all assignees
 - [ ] Summary alert shows correct statistics
 - [ ] Email subject is: "Task Updates - changes require your attention"
+- [ ] Task notification email renders with HTML card layout (with plain-text fallback)
 - [ ] Email dates are in dd-mm-yyyy format
 - [ ] Change a task status and run again
 - [ ] Only the person whose task changed gets an email
@@ -256,6 +257,27 @@ Use this checklist to verify everything works:
 - [ ] Previous assignee gets deletion notification
 - [ ] Add a new task and run again
 - [ ] New assignee gets notification
+
+### Meeting Notification Checklist
+
+If you use the "Reuniones" sheet, also validate meeting emails:
+
+- [ ] Menu "📧 Notifications → Notificar reuniones" is available
+- [ ] First run creates "_meetings_history"
+- [ ] NEW meeting email includes action links for Add/Update/Delete in Google Calendar and Send message to all attendees
+- [ ] "Add to Google Calendar" opens a prefilled event with title/date/time/details
+- [ ] Default duration in the prefilled event is 30 minutes
+- [ ] "Update meeting in Google Calendar" opens Calendar search/context for manual edit
+- [ ] "Delete meeting in Google Calendar" opens Calendar search/context for manual delete
+- [ ] "Send message to all attendees" opens an email draft with attendees + notification sender in recipients
+- [ ] CHANGED meeting emails include update/delete helper links
+- [ ] CHANGED meeting emails include the message-all action
+- [ ] DELETED meeting emails include delete helper link
+- [ ] DELETED meeting emails include the message-all action
+- [ ] Agenda/documentation/spreadsheet URL appear in add-event details when available
+
+Note: Update/Delete links are guided manual actions and do not directly modify the attendee calendar event.
+Note: Message-all uses a mailto draft and depends on the recipient mail client behavior.
 
 ---
 

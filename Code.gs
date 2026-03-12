@@ -101,6 +101,7 @@ const CONFIG = {
     EMAIL_SUBJECT: 'Reunión de equipo - convocatoria',
     MENU_ITEM: 'Notificar reuniones',
     COMPLETED_STATUS: 'Completada',
+    CALENDAR_DEFAULT_DURATION_MINUTES: 30,
 
     COLUMNS: {
       TITLE: 0,         // Columna A
@@ -479,7 +480,7 @@ function getMeetingFromRow(sheet, row, rowIndex) {
  * @returns {string} Unique meeting ID
  */
 function generateMeetingId(sheetName, rowIndex, title) {
-  return `${sheetName}_Row${rowIndex}_${title.substring(0, 20).replace(/\s+/g, '_')}`;
+  return `${sheetName}_Row${rowIndex}_${title.substring(0, 30).replace(/\s+/g, '_')}`;
 }
 
 
@@ -1176,10 +1177,19 @@ function sendChangeNotifications(changes, spreadsheetUrl) {
         spreadsheetUrl
       );
 
+      const emailHtmlBody = buildTaskEmailHtml(
+        email,
+        tasks.new,
+        tasks.changed,
+        tasks.deleted,
+        spreadsheetUrl
+      );
+
       MailApp.sendEmail({
         to: email,
         subject: CONFIG.EMAIL_SUBJECT,
-        body: emailBody
+        body: emailBody,
+        htmlBody: emailHtmlBody
       });
 
       emailsSent++;
@@ -1339,16 +1349,6 @@ function buildEmailBody(assigneeEmail, newTasks, changedTasks, deletedTasks, spr
     deletedTasks.forEach(task => {
       body += `🗑️ TAREA ELIMINADA en la hoja ${task.sheetName}\n\n`;
       body += `Tarea: ${task.task}\n`;
-      body += `  Prioridad: ${task.priority}\n`;
-      body += `  Estado: ${task.status}\n`;
-      body += `  Producto: ${task.product}\n`;
-      if (task.assignees) {
-        body += `  Asignado a: ${task.assignees}\n`;
-      }
-      if (task.notes) {
-        body += `  Notas: ${task.notes}\n`;
-      }
-      body += `  \n`;
       body += `  → Esta tarea fue eliminada de tus asignaciones\n\n`;
       body += `───────────────────────────────────────────────────────\n\n`;
     });
@@ -1364,6 +1364,207 @@ function buildEmailBody(assigneeEmail, newTasks, changedTasks, deletedTasks, spr
 }
 
 /**
+ * Builds HTML email body with task change details.
+ * @param {string} assigneeEmail - Recipient email
+ * @param {Array} newTasks - New tasks
+ * @param {Array} changedTasks - Changed tasks with change details
+ * @param {Array} deletedTasks - Deleted tasks
+ * @param {string} spreadsheetUrl - Spreadsheet URL
+ * @returns {string} Formatted HTML body
+ */
+function buildTaskEmailHtml(assigneeEmail, newTasks, changedTasks, deletedTasks, spreadsheetUrl) {
+  const totalChanges = newTasks.length + changedTasks.length + deletedTasks.length;
+  let html = '';
+
+  html += '<div style="margin:0;padding:0;background:#f5f7fb;">';
+  html += '<div style="max-width:700px;margin:0 auto;padding:24px 14px;font-family:\'Segoe UI\', Arial, sans-serif;color:#1f2937;">';
+  html += '<div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;padding:20px;">';
+  html += `<h2 style="margin:0 0 10px 0;font-size:22px;line-height:1.2;color:#111827;">Tareas actualizadas</h2>`;
+  html += `<p style="margin:0 0 16px 0;font-size:14px;color:#4b5563;">Tienes <strong>${totalChanges}</strong> tarea(s) actualizadas recientemente.</p>`;
+
+  if (newTasks.length > 0) {
+    newTasks.forEach(task => {
+      const assigneeCount = parseMultipleEmails(task.assignees || '').length;
+      const footerText = assigneeCount > 1
+        ? `Esta tarea fue asignada a ti y ${assigneeCount - 1} colaborador(es) más.`
+        : 'Esta tarea fue asignada recientemente a ti.';
+      html += buildTaskCardHtml('✨ NUEVA TAREA ASIGNADA', '#e8f7ee', '#2f855a', task, null, footerText);
+    });
+  }
+
+  if (changedTasks.length > 0) {
+    changedTasks.forEach(changeObj => {
+      const task = changeObj.task;
+      const changesHtml = buildTaskChangesHtml(changeObj.changes);
+      html += buildTaskCardHtml('📝 TAREA ACTUALIZADA', '#fff8e8', '#9a6700', task, changesHtml, `${changeObj.changes.length} cambio(s) desde la última notificación.`);
+    });
+  }
+
+  if (deletedTasks.length > 0) {
+    deletedTasks.forEach(task => {
+      html += buildTaskCardHtml('🗑️ TAREA ELIMINADA', '#fdecec', '#b42318', task, null, 'Esta tarea fue eliminada de tus asignaciones.', {
+        showPriority: false,
+        showStatus: false,
+        showProduct: false,
+        showInitDate: false,
+        showFinishDate: false,
+        showAssignees: false,
+        showNotes: false
+      });
+    });
+  }
+
+  html += '<div style="margin-top:18px;padding-top:14px;border-top:1px solid #e5e7eb;">';
+  html += `<p style="margin:0 0 8px 0;font-size:13px;"><a href="${escapeHtml(spreadsheetUrl)}" target="_blank" style="color:#1d4ed8;text-decoration:none;">Ver el tablero completo</a></p>`;
+  html += `<p style="margin:0;font-size:12px;color:#6b7280;">Notificación enviada: ${escapeHtml(formatDateTime(new Date()))}</p>`;
+  html += '<p style="margin:10px 0 0 0;font-size:12px;color:#6b7280;">Estás recibiendo esto porque las tareas asignadas a ti han cambiado.</p>';
+  html += '</div>';
+
+  html += '</div>';
+  html += '</div>';
+  html += '</div>';
+
+  return html;
+}
+
+/**
+ * Builds an HTML card for a task item.
+ * @param {string} title - Card title label
+ * @param {string} badgeBackground - Badge background color
+ * @param {string} badgeColor - Badge text color
+ * @param {Object} task - Task object
+ * @param {string|null} changesHtml - Changes block HTML
+ * @param {string} footerText - Card footer text
+ * @param {Object=} displayOptions - Optional field visibility flags
+ * @returns {string} HTML card
+ */
+function buildTaskCardHtml(title, badgeBackground, badgeColor, task, changesHtml, footerText, displayOptions) {
+  let card = '';
+  const resolvedDisplayOptions = Object.assign({
+    showPriority: true,
+    showStatus: true,
+    showProduct: true,
+    showInitDate: true,
+    showFinishDate: true,
+    showAssignees: true,
+    showNotes: true
+  }, displayOptions || {});
+
+  card += '<div style="margin:0 0 14px 0;padding:16px;border:1px solid #e5e7eb;border-radius:12px;background:#ffffff;">';
+  card += `<div style="display:inline-block;font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px;background:${badgeBackground};color:${badgeColor};margin-bottom:10px;">${escapeHtml(title)}</div>`;
+  card += `<h3 style="margin:0 0 10px 0;font-size:18px;color:#111827;">${escapeHtml(task.task || '(sin nombre)')}</h3>`;
+
+  if (task.sheetName) {
+    card += `<p style="margin:0 0 4px 0;font-size:14px;"><strong>Hoja:</strong> ${escapeHtml(task.sheetName)}</p>`;
+  }
+
+  if (resolvedDisplayOptions.showPriority && task.priority) {
+    card += `<p style="margin:0 0 4px 0;font-size:14px;"><strong>Prioridad:</strong> ${escapeHtml(task.priority)}</p>`;
+  }
+
+  if (resolvedDisplayOptions.showStatus && task.status) {
+    card += `<p style="margin:0 0 4px 0;font-size:14px;"><strong>Estado:</strong> ${escapeHtml(task.status)}</p>`;
+  }
+
+  if (resolvedDisplayOptions.showProduct && task.product) {
+    card += `<p style="margin:0 0 4px 0;font-size:14px;"><strong>Producto:</strong> ${escapeHtml(task.product)}</p>`;
+  }
+
+  const initDate = formatDate(task.initDate);
+  if (resolvedDisplayOptions.showInitDate && initDate) {
+    card += `<p style="margin:0 0 4px 0;font-size:14px;"><strong>Fecha de inicio:</strong> ${escapeHtml(initDate)}</p>`;
+  }
+
+  const finishDate = formatDate(task.finishDate);
+  if (resolvedDisplayOptions.showFinishDate && finishDate) {
+    card += `<p style="margin:0 0 10px 0;font-size:14px;"><strong>Fecha de finalización:</strong> ${escapeHtml(finishDate)}</p>`;
+  }
+
+  if (resolvedDisplayOptions.showAssignees && task.assignees) {
+    card += `<p style="margin:0 0 8px 0;font-size:13px;"><strong>Asignado a:</strong> ${escapeHtml(task.assignees)}</p>`;
+  }
+
+  if (changesHtml) {
+    card += changesHtml;
+  }
+
+  if (resolvedDisplayOptions.showNotes && task.notes) {
+    card += '<p style="margin:10px 0 4px 0;font-size:13px;font-weight:700;color:#374151;">Notas</p>';
+    card += `<p style="margin:0;font-size:13px;color:#4b5563;line-height:1.45;">${textToHtml(task.notes)}</p>`;
+  }
+
+  card += `<p style="margin:10px 0 0 0;font-size:12px;color:#6b7280;">${escapeHtml(footerText)}</p>`;
+  card += '</div>';
+
+  return card;
+}
+
+/**
+ * Builds HTML list of task changes.
+ * @param {Array} changes - Changed fields
+ * @returns {string} HTML block
+ */
+function buildTaskChangesHtml(changes) {
+  if (!changes || changes.length === 0) {
+    return '';
+  }
+
+  let html = '';
+  html += '<div style="margin-top:8px;padding:10px;background:#fffbeb;border:1px solid #f3e8bb;border-radius:8px;">';
+  html += '<p style="margin:0 0 6px 0;font-size:13px;font-weight:700;color:#7c5a00;">Cambios detectados</p>';
+  html += '<ul style="margin:0;padding-left:18px;font-size:13px;color:#4b5563;">';
+
+  changes.forEach(change => {
+    html += `<li style="margin:0 0 4px 0;">${escapeHtml(formatTaskChangeText(change))}</li>`;
+  });
+
+  html += '</ul>';
+  html += '</div>';
+  return html;
+}
+
+/**
+ * Formats one changed task field for display.
+ * @param {Object} change - Change object
+ * @returns {string} Human-readable change text
+ */
+function formatTaskChangeText(change) {
+  if (change.field === 'TASK') {
+    return `Nombre de tarea: "${change.oldValue}" -> "${change.newValue}"`;
+  }
+
+  if (change.field === 'PRIORITY') {
+    return `Prioridad: ${change.oldValue} -> ${change.newValue}`;
+  }
+
+  if (change.field === 'STATUS') {
+    return `Estado: ${change.oldValue} -> ${change.newValue}`;
+  }
+
+  if (change.field === 'INIT_DATE') {
+    return `Fecha de inicio: ${change.oldValue} -> ${change.newValue}`;
+  }
+
+  if (change.field === 'FINISH_DATE') {
+    return `Fecha de finalización: ${change.oldValue} -> ${change.newValue}`;
+  }
+
+  if (change.field === 'PRODUCT') {
+    return `Producto: ${change.oldValue} -> ${change.newValue}`;
+  }
+
+  if (change.field === 'EMAIL') {
+    return `Asignado a: ${change.oldValue} -> ${change.newValue}`;
+  }
+
+  if (change.field === 'NOTES') {
+    return 'Notas actualizadas';
+  }
+
+  return `${change.field}: ${change.oldValue} -> ${change.newValue}`;
+}
+
+/**
  * Sends consolidated email notifications to attendees with changed meetings
  * @param {Object} changes - Detected changes
  * @param {string} spreadsheetUrl - URL of the spreadsheet
@@ -1372,6 +1573,7 @@ function buildEmailBody(assigneeEmail, newTasks, changedTasks, deletedTasks, spr
 function sendMeetingNotifications(changes, spreadsheetUrl) {
   const meetingsByAttendee = groupMeetingsByAttendee(changes);
   let emailsSent = 0;
+  const ownerEmail = resolveNotificationSenderEmail();
 
   meetingsByAttendee.forEach((meetings, email) => {
     try {
@@ -1380,13 +1582,24 @@ function sendMeetingNotifications(changes, spreadsheetUrl) {
         meetings.new,
         meetings.changed,
         meetings.deleted,
-        spreadsheetUrl
+        spreadsheetUrl,
+        ownerEmail
+      );
+
+      const emailHtmlBody = buildMeetingEmailHtml(
+        email,
+        meetings.new,
+        meetings.changed,
+        meetings.deleted,
+        spreadsheetUrl,
+        ownerEmail
       );
 
       MailApp.sendEmail({
         to: email,
         subject: CONFIG.MEETINGS.EMAIL_SUBJECT,
-        body: emailBody
+        body: emailBody,
+        htmlBody: emailHtmlBody
       });
 
       emailsSent++;
@@ -1447,9 +1660,10 @@ function groupMeetingsByAttendee(changes) {
  * @param {Array} changedMeetings - Changed meetings with change details
  * @param {Array} deletedMeetings - Deleted meetings
  * @param {string} spreadsheetUrl - Spreadsheet URL
+ * @param {string} ownerEmail - Notification sender email
  * @returns {string} Formatted email body
  */
-function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, deletedMeetings, spreadsheetUrl) {
+function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, deletedMeetings, spreadsheetUrl, ownerEmail) {
   const totalChanges = newMeetings.length + changedMeetings.length + deletedMeetings.length;
   let body = `Hola,\n\n`;
   body += `Tienes ${totalChanges} reunión(es) programadas o actualizadas:\n\n`;
@@ -1475,6 +1689,14 @@ function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, dele
         body += `  (Asegúrate de tener acceso a los documentos compartidos)\n`;
         body += `\n`;
       }
+
+      body += buildMeetingCalendarActionsText(meeting, spreadsheetUrl, {
+        includeAdd: true,
+        includeUpdate: true,
+        includeDelete: true,
+        includeMessageAll: true
+      }, attendeeEmail, ownerEmail);
+
       body += `  → Esta reunión fue agendada recientemente\n\n`;
       body += `───────────────────────────────────────────────────────\n\n`;
     });
@@ -1543,6 +1765,13 @@ function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, dele
         body += `\n`;
       }
 
+      body += buildMeetingCalendarActionsText(meeting, spreadsheetUrl, {
+        includeAdd: false,
+        includeUpdate: true,
+        includeDelete: true,
+        includeMessageAll: true
+      }, attendeeEmail, ownerEmail);
+
       body += `  → ${changes.length} cambio(s) desde la última notificación\n\n`;
       body += `───────────────────────────────────────────────────────\n\n`;
     });
@@ -1559,6 +1788,14 @@ function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, dele
         body += `  Asistentes: ${meeting.attendees}\n`;
       }
       body += `\n`;
+
+      body += buildMeetingCalendarActionsText(meeting, spreadsheetUrl, {
+        includeAdd: false,
+        includeUpdate: false,
+        includeDelete: true,
+        includeMessageAll: true
+      }, attendeeEmail, ownerEmail);
+
       body += `  → Esta reunión fue eliminada del calendario\n\n`;
       body += `───────────────────────────────────────────────────────\n\n`;
     });
@@ -1571,6 +1808,257 @@ function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, dele
   body += `ℹ️ Estás recibiendo esto porque fuiste invitado a reunión(es) que cambiaron.\n`;
 
   return body;
+}
+
+/**
+ * Builds HTML email body with meeting change details and action buttons.
+ * @param {string} attendeeEmail - Recipient email
+ * @param {Array} newMeetings - New meetings
+ * @param {Array} changedMeetings - Changed meetings with change details
+ * @param {Array} deletedMeetings - Deleted meetings
+ * @param {string} spreadsheetUrl - Spreadsheet URL
+ * @param {string} ownerEmail - Notification sender email
+ * @returns {string} Formatted HTML body
+ */
+function buildMeetingEmailHtml(attendeeEmail, newMeetings, changedMeetings, deletedMeetings, spreadsheetUrl, ownerEmail) {
+  const totalChanges = newMeetings.length + changedMeetings.length + deletedMeetings.length;
+  let html = '';
+
+  html += '<div style="margin:0;padding:0;background:#f5f7fb;">';
+  html += '<div style="max-width:700px;margin:0 auto;padding:24px 14px;font-family:\'Segoe UI\', Arial, sans-serif;color:#1f2937;">';
+  html += '<div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;padding:20px;">';
+  html += `<h2 style="margin:0 0 10px 0;font-size:22px;line-height:1.2;color:#111827;">Reuniones actualizadas</h2>`;
+  html += `<p style="margin:0 0 16px 0;font-size:14px;color:#4b5563;">Tienes <strong>${totalChanges}</strong> reunión(es) programadas o actualizadas.</p>`;
+
+  if (newMeetings.length > 0) {
+    newMeetings.forEach(meeting => {
+      html += buildMeetingCardHtml('✨ NUEVA REUNIÓN PROGRAMADA', '#e8f7ee', '#2f855a', meeting, null, spreadsheetUrl, {
+        includeAdd: true,
+        includeUpdate: true,
+        includeDelete: true,
+        includeMessageAll: true
+      }, 'Esta reunión fue agendada recientemente.', attendeeEmail, ownerEmail);
+    });
+  }
+
+  if (changedMeetings.length > 0) {
+    changedMeetings.forEach(changeObj => {
+      const meeting = changeObj.meeting;
+      const changesHtml = buildMeetingChangesHtml(changeObj.changes);
+      html += buildMeetingCardHtml('📝 REUNIÓN ACTUALIZADA', '#fff8e8', '#9a6700', meeting, changesHtml, spreadsheetUrl, {
+        includeAdd: false,
+        includeUpdate: true,
+        includeDelete: true,
+        includeMessageAll: true
+      }, `${changeObj.changes.length} cambio(s) desde la última notificación.`, attendeeEmail, ownerEmail);
+    });
+  }
+
+  if (deletedMeetings.length > 0) {
+    deletedMeetings.forEach(meeting => {
+      html += buildMeetingCardHtml('🗑️ REUNIÓN CANCELADA/ELIMINADA', '#fdecec', '#b42318', meeting, null, spreadsheetUrl, {
+        includeAdd: false,
+        includeUpdate: false,
+        includeDelete: true,
+        includeMessageAll: true
+      }, 'Esta reunión fue eliminada del calendario.', attendeeEmail, ownerEmail);
+    });
+  }
+
+  html += '<div style="margin-top:18px;padding-top:14px;border-top:1px solid #e5e7eb;">';
+  html += `<p style="margin:0 0 8px 0;font-size:13px;"><a href="${escapeHtml(spreadsheetUrl)}" target="_blank" style="color:#1d4ed8;text-decoration:none;">Ver el calendario completo</a></p>`;
+  html += `<p style="margin:0;font-size:12px;color:#6b7280;">Notificación enviada: ${escapeHtml(formatDateTime(new Date()))}</p>`;
+  html += '<p style="margin:10px 0 0 0;font-size:12px;color:#6b7280;">Estás recibiendo esto porque fuiste invitado a reunión(es) que cambiaron.</p>';
+  html += '</div>';
+
+  html += '</div>';
+  html += '</div>';
+  html += '</div>';
+
+  return html;
+}
+
+/**
+ * Builds an HTML card for a meeting item.
+ * @param {string} title - Card title label
+ * @param {string} badgeBackground - Badge background color
+ * @param {string} badgeColor - Badge text color
+ * @param {Object} meeting - Meeting object
+ * @param {string|null} changesHtml - Changes block HTML
+ * @param {string} spreadsheetUrl - Spreadsheet URL
+ * @param {Object} actionOptions - Which calendar actions to include
+ * @param {string} footerText - Card footer text
+ * @param {string} attendeeEmail - Recipient email
+ * @param {string} ownerEmail - Notification sender email
+ * @returns {string} HTML card
+ */
+function buildMeetingCardHtml(title, badgeBackground, badgeColor, meeting, changesHtml, spreadsheetUrl, actionOptions, footerText, attendeeEmail, ownerEmail) {
+  let card = '';
+
+  card += '<div style="margin:0 0 14px 0;padding:16px;border:1px solid #e5e7eb;border-radius:12px;background:#ffffff;">';
+  card += `<div style="display:inline-block;font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px;background:${badgeBackground};color:${badgeColor};margin-bottom:10px;">${escapeHtml(title)}</div>`;
+  card += `<h3 style="margin:0 0 10px 0;font-size:18px;color:#111827;">${escapeHtml(meeting.title || '(sin título)')}</h3>`;
+  card += `<p style="margin:0 0 4px 0;font-size:14px;"><strong>Fecha y hora:</strong> ${escapeHtml(formatMeetingDateTime(meeting.datetime))}</p>`;
+
+  if (meeting.status) {
+    card += `<p style="margin:0 0 4px 0;font-size:14px;"><strong>Estado:</strong> ${escapeHtml(meeting.status)}</p>`;
+  }
+
+  if (meeting.attendees) {
+    card += `<p style="margin:0 0 10px 0;font-size:14px;"><strong>Asistentes:</strong> ${escapeHtml(meeting.attendees)}</p>`;
+  }
+
+  if (changesHtml) {
+    card += changesHtml;
+  }
+
+  if (meeting.agenda) {
+    card += `<p style="margin:10px 0 4px 0;font-size:13px;font-weight:700;color:#374151;">Agenda</p>`;
+    card += `<p style="margin:0;font-size:13px;color:#4b5563;line-height:1.45;">${textToHtml(meeting.agenda)}</p>`;
+  }
+
+  if (meeting.documentation) {
+    card += `<p style="margin:10px 0 4px 0;font-size:13px;font-weight:700;color:#374151;">Documentación</p>`;
+    card += `<p style="margin:0;font-size:13px;color:#4b5563;line-height:1.45;">${textToHtml(meeting.documentation)}</p>`;
+  }
+
+  card += buildMeetingCalendarActionsHtml(meeting, spreadsheetUrl, actionOptions, attendeeEmail, ownerEmail);
+
+  card += `<p style="margin:10px 0 0 0;font-size:12px;color:#6b7280;">${escapeHtml(footerText)}</p>`;
+  card += '</div>';
+
+  return card;
+}
+
+/**
+ * Builds HTML list of meeting changes.
+ * @param {Array} changes - Changed fields
+ * @returns {string} HTML block
+ */
+function buildMeetingChangesHtml(changes) {
+  if (!changes || changes.length === 0) {
+    return '';
+  }
+
+  let html = '';
+  html += '<div style="margin-top:8px;padding:10px;background:#fffbeb;border:1px solid #f3e8bb;border-radius:8px;">';
+  html += '<p style="margin:0 0 6px 0;font-size:13px;font-weight:700;color:#7c5a00;">Cambios detectados</p>';
+  html += '<ul style="margin:0;padding-left:18px;font-size:13px;color:#4b5563;">';
+
+  changes.forEach(change => {
+    html += `<li style="margin:0 0 4px 0;">${escapeHtml(formatMeetingChangeText(change))}</li>`;
+  });
+
+  html += '</ul>';
+  html += '</div>';
+  return html;
+}
+
+/**
+ * Formats one changed meeting field for display.
+ * @param {Object} change - Change object
+ * @returns {string} Human-readable change text
+ */
+function formatMeetingChangeText(change) {
+  if (change.field === 'TITLE') {
+    return `Título cambiado de: "${change.oldValue}" a "${change.newValue}"`;
+  }
+
+  if (change.field === 'DATE') {
+    return `Fecha: ${change.oldValue} -> ${change.newValue}`;
+  }
+
+  if (change.field === 'TIME') {
+    return `Hora: ${change.oldValue} -> ${change.newValue}`;
+  }
+
+  if (change.field === 'STATUS') {
+    return `Estado: ${change.oldValue} -> ${change.newValue}`;
+  }
+
+  if (change.field === 'ATTENDEES') {
+    return `Asistentes actualizados: ${change.newValue}`;
+  }
+
+  if (change.field === 'AGENDA') {
+    return 'Agenda actualizada';
+  }
+
+  if (change.field === 'DOCUMENTATION') {
+    return 'Documentación actualizada';
+  }
+
+  return `${change.field}: ${change.oldValue} -> ${change.newValue}`;
+}
+
+/**
+ * Renders HTML calendar action buttons for meeting emails.
+ * @param {Object} meeting - Meeting object
+ * @param {string} spreadsheetUrl - Spreadsheet URL
+ * @param {Object} options - Which actions to include
+ * @param {string} attendeeEmail - Recipient email
+ * @param {string} ownerEmail - Notification sender email
+ * @returns {string} Formatted HTML block
+ */
+function buildMeetingCalendarActionsHtml(meeting, spreadsheetUrl, options, attendeeEmail, ownerEmail) {
+  const actions = buildMeetingCalendarActions(meeting, spreadsheetUrl, attendeeEmail, ownerEmail);
+  let html = '';
+
+  html += '<div style="margin-top:12px;padding:10px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;">';
+  html += '<p style="margin:0 0 8px 0;font-size:13px;font-weight:700;color:#334155;">Acciones en Google Calendar</p>';
+
+  if (options.includeAdd) {
+    if (actions.add) {
+      html += `<a href="${escapeHtml(actions.add)}" target="_blank" style="display:inline-block;margin:0 8px 8px 0;padding:8px 12px;background:#1d4ed8;color:#ffffff;text-decoration:none;border-radius:8px;font-size:12px;font-weight:700;">Agregar a Google Calendar</a>`;
+    } else {
+      html += '<p style="margin:0 0 8px 0;font-size:12px;color:#b45309;">Agregar a Google Calendar no disponible (fecha/hora inválida).</p>';
+    }
+  }
+
+  if (options.includeUpdate) {
+    html += `<a href="${escapeHtml(actions.update)}" target="_blank" style="display:inline-block;margin:0 8px 8px 0;padding:8px 12px;background:#0f766e;color:#ffffff;text-decoration:none;border-radius:8px;font-size:12px;font-weight:700;">Actualizar reunión en Google Calendar</a>`;
+    html += '<p style="margin:0 0 8px 0;font-size:12px;color:#64748b;">Abre Google Calendar para localizar la reunión y editarla manualmente.</p>';
+  }
+
+  if (options.includeDelete) {
+    html += `<a href="${escapeHtml(actions.delete)}" target="_blank" style="display:inline-block;margin:0 8px 8px 0;padding:8px 12px;background:#b42318;color:#ffffff;text-decoration:none;border-radius:8px;font-size:12px;font-weight:700;">Eliminar reunión en Google Calendar</a>`;
+    html += '<p style="margin:0;font-size:12px;color:#64748b;">Abre Google Calendar para localizar la reunión y eliminarla manualmente.</p>';
+  }
+
+  if (options.includeMessageAll) {
+    if (actions.messageAll) {
+      html += `<a href="${escapeHtml(actions.messageAll)}" target="_blank" style="display:inline-block;margin:8px 8px 8px 0;padding:8px 12px;background:#7c3aed;color:#ffffff;text-decoration:none;border-radius:8px;font-size:12px;font-weight:700;">Enviar mensaje a todos los asistentes</a>`;
+      html += '<p style="margin:0;font-size:12px;color:#64748b;">Abre tu cliente de correo y prepara un mensaje para asistentes + propietario de la reunión.</p>';
+    } else {
+      html += '<p style="margin:8px 0 0 0;font-size:12px;color:#b45309;">No se pudo generar el enlace para enviar mensaje a todos (sin correos válidos).</p>';
+    }
+  }
+
+  html += '</div>';
+  return html;
+}
+
+/**
+ * Escapes basic HTML special characters.
+ * @param {any} value - Value to escape
+ * @returns {string} Escaped HTML string
+ */
+function escapeHtml(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * Converts plain text to HTML-safe text preserving line breaks.
+ * @param {any} value - Plain text value
+ * @returns {string} HTML-safe text with <br> line breaks
+ */
+function textToHtml(value) {
+  return escapeHtml(value).replace(/\n/g, '<br>');
 }
 
 
@@ -1718,6 +2206,242 @@ function formatMeetingDateTime(datetimeValue) {
   } catch (error) {
     return String(datetimeValue);
   }
+}
+
+/**
+ * Formats datetime for Google Calendar links.
+ * @param {Date} date - Date object
+ * @returns {string} Formatted datetime string yyyyMMdd'T'HHmmss
+ */
+function formatGoogleCalendarDateTime(date) {
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), "yyyyMMdd'T'HHmmss");
+}
+
+/**
+ * Adds minutes to a date and returns a new Date object.
+ * @param {Date} date - Source date
+ * @param {number} minutes - Minutes to add
+ * @returns {Date} New date with minutes added
+ */
+function addMinutesToDate(date, minutes) {
+  const result = new Date(date.getTime());
+  result.setMinutes(result.getMinutes() + minutes);
+  return result;
+}
+
+/**
+ * Builds meeting details text for Google Calendar links.
+ * @param {Object} meeting - Meeting object
+ * @param {string} spreadsheetUrl - Spreadsheet URL
+ * @returns {string} Details text
+ */
+function buildMeetingCalendarDetails(meeting, spreadsheetUrl) {
+  const parts = [];
+
+  if (meeting.agenda) {
+    parts.push(`Agenda:\n${meeting.agenda}`);
+  }
+
+  if (meeting.documentation) {
+    parts.push(`Documentación:\n${meeting.documentation}`);
+  }
+
+  if (spreadsheetUrl) {
+    parts.push(`Calendario completo:\n${spreadsheetUrl}`);
+  }
+
+  return parts.join('\n\n');
+}
+
+/**
+ * Builds a Google Calendar prefilled create-event URL.
+ * @param {Object} meeting - Meeting object
+ * @param {string} spreadsheetUrl - Spreadsheet URL
+ * @returns {string|null} Calendar URL or null when datetime is invalid
+ */
+function buildGoogleCalendarAddUrl(meeting, spreadsheetUrl) {
+  const startDate = parseLocalizedDateOrDateTime(meeting.datetime);
+  if (!startDate) {
+    return null;
+  }
+
+  const endDate = addMinutesToDate(startDate, CONFIG.MEETINGS.CALENDAR_DEFAULT_DURATION_MINUTES);
+  const timezone = Session.getScriptTimeZone();
+  const details = buildMeetingCalendarDetails(meeting, spreadsheetUrl);
+
+  const params = [
+    'action=TEMPLATE',
+    `text=${encodeURIComponent(meeting.title || 'Reunión')}`,
+    `dates=${encodeURIComponent(`${formatGoogleCalendarDateTime(startDate)}/${formatGoogleCalendarDateTime(endDate)}`)}`,
+    `details=${encodeURIComponent(details)}`,
+    `ctz=${encodeURIComponent(timezone)}`
+  ];
+
+  return `https://calendar.google.com/calendar/render?${params.join('&')}`;
+}
+
+/**
+ * Builds a Google Calendar search URL to help users locate a meeting manually.
+ * @param {Object} meeting - Meeting object
+ * @returns {string} Calendar search URL
+ */
+function buildGoogleCalendarSearchUrl(meeting) {
+  const queryParts = [meeting.title || 'reunión'];
+
+  if (meeting.datetime) {
+    queryParts.push(formatMeetingDateTime(meeting.datetime));
+  }
+
+  return `https://calendar.google.com/calendar/u/0/r/search?q=${encodeURIComponent(queryParts.join(' '))}`;
+}
+
+/**
+ * Builds calendar action URLs for meeting emails.
+ * @param {Object} meeting - Meeting object
+ * @param {string} spreadsheetUrl - Spreadsheet URL
+ * @returns {Object} Calendar action URLs
+ */
+function buildMeetingCalendarActions(meeting, spreadsheetUrl, attendeeEmail, ownerEmail) {
+  const searchUrl = buildGoogleCalendarSearchUrl(meeting);
+
+  return {
+    add: buildGoogleCalendarAddUrl(meeting, spreadsheetUrl),
+    update: searchUrl,
+    delete: searchUrl,
+    messageAll: buildMeetingMessageAllMailtoUrl(meeting, attendeeEmail, ownerEmail)
+  };
+}
+
+/**
+ * Renders plain-text calendar action links for meeting emails.
+ * @param {Object} meeting - Meeting object
+ * @param {string} spreadsheetUrl - Spreadsheet URL
+ * @param {Object} options - Which actions to include
+ * @param {string} attendeeEmail - Recipient email
+ * @param {string} ownerEmail - Notification sender email
+ * @returns {string} Formatted text block
+ */
+function buildMeetingCalendarActionsText(meeting, spreadsheetUrl, options, attendeeEmail, ownerEmail) {
+  const actions = buildMeetingCalendarActions(meeting, spreadsheetUrl, attendeeEmail, ownerEmail);
+  const lines = [];
+
+  lines.push('  Acciones en Google Calendar:');
+
+  if (options.includeAdd) {
+    if (actions.add) {
+      lines.push(`  - [Agregar a Google Calendar] ${actions.add}`);
+    } else {
+      lines.push('  - [Agregar a Google Calendar] No disponible (fecha/hora inválida)');
+    }
+  }
+
+  if (options.includeUpdate) {
+    lines.push(`  - [Actualizar reunión en Google Calendar] ${actions.update}`);
+    lines.push('    (Abre Google Calendar para localizar la reunión y editarla manualmente)');
+  }
+
+  if (options.includeDelete) {
+    lines.push(`  - [Eliminar reunión en Google Calendar] ${actions.delete}`);
+    lines.push('    (Abre Google Calendar para localizar la reunión y eliminarla manualmente)');
+  }
+
+  if (options.includeMessageAll) {
+    if (actions.messageAll) {
+      lines.push(`  - [Enviar mensaje a todos los asistentes] ${actions.messageAll}`);
+      lines.push('    (Incluye asistentes y propietario de la reunión en tu correo)');
+    } else {
+      lines.push('  - [Enviar mensaje a todos los asistentes] No disponible (sin correos válidos)');
+    }
+  }
+
+  lines.push('');
+  return lines.join('\n') + '\n';
+}
+
+/**
+ * Resolves notification sender email to be used as meeting owner.
+ * @returns {string} Sender email or empty string when unavailable
+ */
+function resolveNotificationSenderEmail() {
+  try {
+    const activeEmail = sanitizeValue(Session.getActiveUser().getEmail()).toLowerCase();
+    if (isValidEmail(activeEmail)) {
+      return activeEmail;
+    }
+  } catch (error) {
+    Logger.log(`Active user email unavailable: ${error.toString()}`);
+  }
+
+  try {
+    const effectiveEmail = sanitizeValue(Session.getEffectiveUser().getEmail()).toLowerCase();
+    if (isValidEmail(effectiveEmail)) {
+      return effectiveEmail;
+    }
+  } catch (error) {
+    Logger.log(`Effective user email unavailable: ${error.toString()}`);
+  }
+
+  Logger.log('Notification sender email unavailable; message-all action will use attendees only.');
+  return '';
+}
+
+/**
+ * Builds a normalized and deduplicated recipient list for message-all action.
+ * Includes meeting attendees and owner (notification sender).
+ * @param {Object} meeting - Meeting object
+ * @param {string} attendeeEmail - Notification recipient email
+ * @param {string} ownerEmail - Notification sender email
+ * @returns {Array<string>} Recipient emails
+ */
+function buildMeetingMessageRecipients(meeting, attendeeEmail, ownerEmail) {
+  const attendees = parseMultipleEmails(meeting.attendees || '');
+  const recipients = [];
+
+  attendees.forEach(email => {
+    if (isValidEmail(email)) {
+      recipients.push(email.toLowerCase());
+    }
+  });
+
+  if (isValidEmail(ownerEmail)) {
+    recipients.push(ownerEmail.toLowerCase());
+  }
+
+  if (isValidEmail(attendeeEmail)) {
+    recipients.push(attendeeEmail.toLowerCase());
+  }
+
+  return [...new Set(recipients)];
+}
+
+/**
+ * Builds a mailto URL for messaging all attendees and owner.
+ * @param {Object} meeting - Meeting object
+ * @param {string} attendeeEmail - Notification recipient email
+ * @param {string} ownerEmail - Notification sender email
+ * @returns {string|null} Mailto URL or null if no recipients available
+ */
+function buildMeetingMessageAllMailtoUrl(meeting, attendeeEmail, ownerEmail) {
+  const recipients = buildMeetingMessageRecipients(meeting, attendeeEmail, ownerEmail);
+  if (recipients.length === 0) {
+    return null;
+  }
+
+  const subject = `Mensaje sobre reunión: ${meeting.title || 'Reunión'}`;
+  const bodyLines = [
+    'Hola equipo,',
+    '',
+    `Comparto este mensaje sobre la reunión "${meeting.title || 'Reunión'}".`,
+    `Fecha y hora: ${formatMeetingDateTime(meeting.datetime)}`,
+    '',
+    'Mensaje:'
+  ];
+
+  const toParam = recipients.join(',');
+  const subjectParam = encodeURIComponent(subject);
+  const bodyParam = encodeURIComponent(bodyLines.join('\n'));
+
+  return `mailto:${toParam}?subject=${subjectParam}&body=${bodyParam}`;
 }
 
 /**

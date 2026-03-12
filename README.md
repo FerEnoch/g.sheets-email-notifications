@@ -14,6 +14,7 @@ This Google Apps Script automatically detects changes in your project management
 - **📊 Multi-sheet Support** - Automatically processes all sheets in your spreadsheet
 - **🗂️ History Tracking** - Maintains complete audit trail in dedicated History sheet
 - **👥 Consolidated Emails** - One email per person with all their changes grouped together
+- **🎨 HTML Task Emails** - Task notifications are sent as rich HTML with plain-text fallback
 - **🔔 Deletion Notifications** - Alerts previous assignee when tasks are removed
 - **📅 Consistent Formatting** - All dates in dd-mm-yyyy format
 - **✉️ Multi-Assignee Tasks** - Assign tasks to multiple people using comma or semicolon separators (e.g., `user1@x.com, user2@x.com`)
@@ -85,7 +86,7 @@ For detailed instructions, see [DEPLOYMENT_INSTRUCTIONS.md](./DEPLOYMENT_INSTRUC
    - 🗑️ **Deleted tasks** - Removed from spreadsheet
    - ⏭️ **Unchanged tasks** - Skipped (no notification)
 4. Groups changes by assignee email
-5. Sends ONE consolidated email per person (only if they have changes)
+5. Sends ONE consolidated email per person (HTML + plain-text fallback)
 6. Saves new snapshot to History sheet
 7. Shows summary alert with statistics
 
@@ -95,7 +96,17 @@ Works identically to task notifications but:
 - Uses the "Reuniones" sheet instead of task sheets
 - Creates a separate "_meetings_history" sheet
 - Sends meeting-specific email format
+- Includes Google Calendar action links in emails:
+  - Add to Google Calendar (prefilled event)
+  - Update meeting in Google Calendar (guided manual action)
+  - Delete meeting in Google Calendar (guided manual action)
+  - Send message to all attendees (opens mail client draft)
+- Uses a default 30-minute duration for the prefilled add-event link
+- Adds agenda, documentation, and spreadsheet link in event details
 - Triggered via "Notify meeting attendees" menu option
+
+Note: Update/Delete links open Google Calendar with search context so the attendee can edit or remove the correct event manually.
+Note: "Send message to all attendees" includes all meeting attendees plus the notification sender as recipients.
 
 ### Multi-Assignee Support
 
@@ -261,6 +272,7 @@ Possible additions (not currently implemented):
 - Added multi-assignee support for tasks (comma/semicolon separated emails)
 - Added meeting notification system with separate "Reuniones" sheet
 - Added independent history tracking for meetings (_meetings_history)
+- Added Google Calendar action links in meeting emails (add/update/delete helper actions)
 
 **v1.0** (February 2026)
 - Initial release with task notification system
