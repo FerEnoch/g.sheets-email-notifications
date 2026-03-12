@@ -137,11 +137,13 @@ const CONFIG = {
     ALERTS: {
       NO_MEETINGS: 'No se encontraron reuniones en la hoja. Por favor, agregue reuniones primero.',
       SUMMARY_TITLE: '✓ Resumen de notificaciones de reuniones',
-      SUMMARY_MESSAGE: (totalMeetings, newCount, changedCount, deletedCount, unchangedCount, emailsSent) =>
+      SUMMARY_MESSAGE: (totalMeetings, newCount, changedCount, deletedCount, postponedCount, cancelledCount, unchangedCount, emailsSent) =>
         `• ${totalMeetings} reunión(es) escaneada(s)\n` +
         `• ${newCount} reunión(es) nueva(s) detectada(s)\n` +
         `• ${changedCount} reunión(es) cambiada(s)\n` +
         `• ${deletedCount} reunión(es) eliminada(s)\n` +
+        `• ${postponedCount} reunión(es) pospuesta(s) detectada(s)\n` +
+        `• ${cancelledCount} reunión(es) cancelada(s) detectada(s)\n` +
         `• ${unchangedCount} reunión(es) sin cambios (no notificadas)\n\n` +
         `📧 Correos enviados a ${emailsSent} asistente(s)\n\n` +
         `Snapshot guardado en la hoja ${CONFIG.MEETINGS.HISTORY_SHEET_NAME}.`
@@ -273,6 +275,8 @@ function notifyMeetingAttendees() {
     const newCount = changes.new.length;
     const changedCount = changes.changed.length;
     const deletedCount = changes.deleted.length;
+    const postponedCount = changes.postponed.length;
+    const cancelledCount = changes.cancelled.length;
     const unchangedCount = changes.unchanged.length;
 
     const summary = CONFIG.MEETINGS.ALERTS.SUMMARY_MESSAGE(
@@ -280,6 +284,8 @@ function notifyMeetingAttendees() {
       newCount,
       changedCount,
       deletedCount,
+      postponedCount,
+      cancelledCount,
       unchangedCount,
       notificationStats.emailsSent
     );
@@ -760,17 +766,26 @@ function saveMeetingsSnapshot(meetings, changes) {
 
   const timestamp = formatDateTime(new Date());
   const rows = [];
+  const postponedPreviousKeys = new Set(
+    changes.postponed.map(changeObj => `${changeObj.previousMeeting.meetingId}|${changeObj.previousMeeting.email}`)
+  );
 
   // Create a set of notified meeting keys (meetingId + email)
   const notifiedKeys = new Set();
   changes.new.forEach(m => notifiedKeys.add(`${m.meetingId}|${m.email}`));
   changes.changed.forEach(m => notifiedKeys.add(`${m.meeting.meetingId}|${m.meeting.email}`));
+  changes.postponed.forEach(m => notifiedKeys.add(`${m.meeting.meetingId}|${m.meeting.email}`));
+  changes.cancelled.forEach(m => notifiedKeys.add(`${m.meeting.meetingId}|${m.meeting.email}`));
 
   // Add current state of all meetings
   meetings.forEach(meeting => {
     const currentKey = `${meeting.meetingId}|${meeting.email}`;
     let action = 'UNCHANGED';
-    if (changes.new.find(m => `${m.meetingId}|${m.email}` === currentKey)) {
+    if (changes.postponed.find(m => `${m.meeting.meetingId}|${m.meeting.email}` === currentKey)) {
+      action = 'POSTPONED';
+    } else if (changes.cancelled.find(m => `${m.meeting.meetingId}|${m.meeting.email}` === currentKey)) {
+      action = 'CANCELLED';
+    } else if (changes.new.find(m => `${m.meetingId}|${m.email}` === currentKey)) {
       action = 'NEW';
     } else if (changes.changed.find(m => `${m.meeting.meetingId}|${m.meeting.email}` === currentKey)) {
       action = 'CHANGED';
@@ -794,6 +809,14 @@ function saveMeetingsSnapshot(meetings, changes) {
 
   // Add deleted meetings
   changes.deleted.forEach(meeting => {
+    const deletedKey = `${meeting.meetingId}|${meeting.email}`;
+
+    // Skip synthetic deleted rows generated for postponed meetings.
+    // Persisting these would overwrite the latest baseline and retrigger notifications.
+    if (postponedPreviousKeys.has(deletedKey)) {
+      return;
+    }
+
     rows.push([
       timestamp,
       meeting.meetingId,
@@ -996,7 +1019,9 @@ function compareMeetingsSnapshots(currentMeetings, previousSnapshot) {
     new: [],
     changed: [],
     deleted: [],
-    unchanged: []
+    unchanged: [],
+    postponed: [],
+    cancelled: []
   };
 
   const currentKeys = new Set();
@@ -1039,19 +1064,52 @@ function compareMeetingsSnapshots(currentMeetings, previousSnapshot) {
     currentKeys.add(resolvedKey);
 
     if (!previousMeeting) {
-      changes.new.push(currentMeeting);
+      if (isCancelledMeetingStatus(currentMeeting.status)) {
+        changes.cancelled.push({
+          meeting: currentMeeting,
+          changes: [],
+          previousMeeting: currentMeeting
+        });
+      } else {
+        changes.new.push(currentMeeting);
+      }
       return;
     }
 
     matchedPreviousKeys.add(resolvedKey);
+
+    // Already-notified cancelled meetings stay tracked but should not notify again.
+    if (previousMeeting.action === 'CANCELLED' && isCancelledMeetingStatus(currentMeeting.status)) {
+      changes.unchanged.push(currentMeeting);
+      return;
+    }
+
     const fieldChanges = detectMeetingFieldChanges(currentMeeting, previousMeeting);
 
     if (fieldChanges.length > 0) {
-      changes.changed.push({
-        meeting: currentMeeting,
-        changes: fieldChanges,
-        previousMeeting: previousMeeting
-      });
+      if (isPostponedMeetingReschedule(currentMeeting, fieldChanges)) {
+        changes.postponed.push({
+          meeting: currentMeeting,
+          changes: fieldChanges,
+          previousMeeting: previousMeeting
+        });
+
+        // Notify postponed meetings as delete + create actions.
+        changes.new.push(currentMeeting);
+        changes.deleted.push(previousMeeting);
+      } else if (isCancelledMeetingUpdate(currentMeeting, previousMeeting)) {
+        changes.cancelled.push({
+          meeting: currentMeeting,
+          changes: fieldChanges,
+          previousMeeting: previousMeeting
+        });
+      } else {
+        changes.changed.push({
+          meeting: currentMeeting,
+          changes: fieldChanges,
+          previousMeeting: previousMeeting
+        });
+      }
     } else {
       changes.unchanged.push(currentMeeting);
     }
@@ -1149,6 +1207,77 @@ function detectMeetingFieldChanges(currentMeeting, previousMeeting) {
   });
 
   return fieldChanges;
+}
+
+/**
+ * Detects postponed meetings that should be handled as delete/create notifications.
+ * Rules:
+ * - Current status must be "Pospuesta"
+ * - At least date or time changed
+ * - No other fields changed except optional status update
+ * @param {Object} currentMeeting - Current meeting state
+ * @param {Array} fieldChanges - Detected field-level changes
+ * @returns {boolean} True when meeting should be treated as postponed
+ */
+function isPostponedMeetingReschedule(currentMeeting, fieldChanges) {
+  if (!currentMeeting || !fieldChanges || fieldChanges.length === 0) {
+    return false;
+  }
+
+  const normalizedStatus = removeDiacritics(
+    normalizeStringForComparison(currentMeeting.status).toLowerCase()
+  );
+
+  if (normalizedStatus !== 'pospuesta') {
+    return false;
+  }
+
+  const changedFields = fieldChanges.map(change => change.field);
+  const hasDateOrTimeChange = changedFields.includes('DATE') || changedFields.includes('TIME');
+
+  if (!hasDateOrTimeChange) {
+    return false;
+  }
+
+  const allowedFields = new Set(['DATE', 'TIME', 'STATUS']);
+  return changedFields.every(field => allowedFields.has(field));
+}
+
+/**
+ * Checks whether a meeting status represents a cancelled meeting.
+ * @param {string} status - Meeting status text
+ * @returns {boolean} True when status is cancelled-like
+ */
+function isCancelledMeetingStatus(status) {
+  const normalizedStatus = removeDiacritics(
+    normalizeStringForComparison(status).toLowerCase()
+  );
+
+  return normalizedStatus === 'cancelada'
+    || normalizedStatus === 'cancelado'
+    || normalizedStatus === 'cancelled'
+    || normalizedStatus === 'canceled';
+}
+
+/**
+ * Detects cancelled meetings that should be notified in a dedicated category.
+ * @param {Object} currentMeeting - Current meeting state
+ * @param {Object} previousMeeting - Previous meeting state
+ * @returns {boolean} True when meeting should be treated as cancelled
+ */
+function isCancelledMeetingUpdate(currentMeeting, previousMeeting) {
+  if (!currentMeeting || !previousMeeting) {
+    return false;
+  }
+
+  if (!isCancelledMeetingStatus(currentMeeting.status)) {
+    return false;
+  }
+
+  // Notify as cancelled when transitioning from any non-cancelled state,
+  // or when no prior cancelled action exists in history yet.
+  return !isCancelledMeetingStatus(previousMeeting.status)
+    || previousMeeting.action !== 'CANCELLED';
 }
 
 
@@ -1582,6 +1711,8 @@ function sendMeetingNotifications(changes, spreadsheetUrl) {
         meetings.new,
         meetings.changed,
         meetings.deleted,
+        meetings.postponed,
+        meetings.cancelled,
         spreadsheetUrl,
         ownerEmail
       );
@@ -1591,13 +1722,17 @@ function sendMeetingNotifications(changes, spreadsheetUrl) {
         meetings.new,
         meetings.changed,
         meetings.deleted,
+        meetings.postponed,
+        meetings.cancelled,
         spreadsheetUrl,
         ownerEmail
       );
 
+      const subject = buildMeetingEmailSubject(meetings);
+
       MailApp.sendEmail({
         to: email,
-        subject: CONFIG.MEETINGS.EMAIL_SUBJECT,
+        subject: subject,
         body: emailBody,
         htmlBody: emailHtmlBody
       });
@@ -1615,6 +1750,30 @@ function sendMeetingNotifications(changes, spreadsheetUrl) {
 }
 
 /**
+ * Builds a contextual subject line for meeting notifications.
+ * Marks emails as postponed when they contain only postponed meetings.
+ * @param {Object} meetingsByType - Recipient meetings grouped by type
+ * @returns {string} Subject text
+ */
+function buildMeetingEmailSubject(meetingsByType) {
+  const newCount = (meetingsByType.new || []).length;
+  const changedCount = (meetingsByType.changed || []).length;
+  const deletedCount = (meetingsByType.deleted || []).length;
+  const postponedCount = (meetingsByType.postponed || []).length;
+  const cancelledCount = (meetingsByType.cancelled || []).length;
+
+  if (cancelledCount > 0 && newCount === 0 && changedCount === 0 && deletedCount === 0 && postponedCount === 0) {
+    return `${CONFIG.MEETINGS.EMAIL_SUBJECT} - Cancelada`;
+  }
+
+  if (postponedCount > 0 && newCount === 0 && changedCount === 0 && deletedCount === 0 && cancelledCount === 0) {
+    return `${CONFIG.MEETINGS.EMAIL_SUBJECT} - Pospuesta`;
+  }
+
+  return CONFIG.MEETINGS.EMAIL_SUBJECT;
+}
+
+/**
  * Groups meetings by attendee email address
  * Filters out meetings with status "Completada" (finished meetings don't need notifications)
  * @param {Object} changes - Detected changes
@@ -1623,16 +1782,28 @@ function sendMeetingNotifications(changes, spreadsheetUrl) {
 function groupMeetingsByAttendee(changes) {
   const meetingsByAttendee = new Map();
 
+  const postponedCurrentKeys = new Set(
+    changes.postponed.map(changeObj => `${changeObj.meeting.meetingId}|${changeObj.meeting.email}`)
+  );
+  const postponedPreviousKeys = new Set(
+    changes.postponed.map(changeObj => `${changeObj.previousMeeting.meetingId}|${changeObj.previousMeeting.email}`)
+  );
+
   // Helper function to add meeting to attendee's list
   const addToAttendee = (email, category, meeting) => {
     if (!meetingsByAttendee.has(email)) {
-      meetingsByAttendee.set(email, { new: [], changed: [], deleted: [] });
+      meetingsByAttendee.set(email, { new: [], changed: [], deleted: [], postponed: [], cancelled: [] });
     }
     meetingsByAttendee.get(email)[category].push(meeting);
   };
 
   // Add new meetings (skip completed ones)
   changes.new.forEach(meeting => {
+    const meetingKey = `${meeting.meetingId}|${meeting.email}`;
+    if (postponedCurrentKeys.has(meetingKey)) {
+      return;
+    }
+
     if (meeting.status !== CONFIG.MEETINGS.COMPLETED_STATUS) {
       addToAttendee(meeting.email, 'new', meeting);
     }
@@ -1647,7 +1818,24 @@ function groupMeetingsByAttendee(changes) {
 
   // Add deleted meetings (use previous attendee)
   changes.deleted.forEach(meeting => {
+    const meetingKey = `${meeting.meetingId}|${meeting.email}`;
+    if (postponedPreviousKeys.has(meetingKey)) {
+      return;
+    }
+
     addToAttendee(meeting.email, 'deleted', meeting);
+  });
+
+  // Add postponed meetings as their own notification type (skip completed status)
+  changes.postponed.forEach(changeObj => {
+    if (changeObj.meeting.status !== CONFIG.MEETINGS.COMPLETED_STATUS) {
+      addToAttendee(changeObj.meeting.email, 'postponed', changeObj);
+    }
+  });
+
+  // Add cancelled meetings as their own notification type.
+  changes.cancelled.forEach(changeObj => {
+    addToAttendee(changeObj.meeting.email, 'cancelled', changeObj);
   });
 
   return meetingsByAttendee;
@@ -1659,12 +1847,14 @@ function groupMeetingsByAttendee(changes) {
  * @param {Array} newMeetings - New meetings
  * @param {Array} changedMeetings - Changed meetings with change details
  * @param {Array} deletedMeetings - Deleted meetings
+ * @param {Array} postponedMeetings - Postponed meetings with change details
+ * @param {Array} cancelledMeetings - Cancelled meetings with change details
  * @param {string} spreadsheetUrl - Spreadsheet URL
  * @param {string} ownerEmail - Notification sender email
  * @returns {string} Formatted email body
  */
-function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, deletedMeetings, spreadsheetUrl, ownerEmail) {
-  const totalChanges = newMeetings.length + changedMeetings.length + deletedMeetings.length;
+function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, deletedMeetings, postponedMeetings, cancelledMeetings, spreadsheetUrl, ownerEmail) {
+  const totalChanges = newMeetings.length + changedMeetings.length + deletedMeetings.length + postponedMeetings.length + cancelledMeetings.length;
   let body = `Hola,\n\n`;
   body += `Tienes ${totalChanges} reunión(es) programadas o actualizadas:\n\n`;
   body += `═══════════════════════════════════════════════════════\n\n`;
@@ -1801,6 +1991,73 @@ function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, dele
     });
   }
 
+  // Section 4: Postponed meetings
+  if (postponedMeetings.length > 0) {
+    postponedMeetings.forEach(changeObj => {
+      const meeting = changeObj.meeting;
+      const previousMeeting = changeObj.previousMeeting;
+
+      body += `⏰ REUNIÓN POSPUESTA\n\n`;
+      body += `📅 ${meeting.title}\n`;
+      body += `  Fecha y hora anterior: ${formatMeetingDateTime(previousMeeting.datetime)}\n`;
+      body += `  Nueva fecha y hora: ${formatMeetingDateTime(meeting.datetime)}\n`;
+      body += `  Estado: ${meeting.status}\n`;
+      if (meeting.attendees) {
+        body += `  Asistentes: ${meeting.attendees}\n`;
+      }
+      body += `\n`;
+
+      if (meeting.agenda) {
+        body += `  Agenda:\n`;
+        body += `  ${meeting.agenda}\n`;
+        body += `\n`;
+      }
+
+      if (meeting.documentation) {
+        body += `  📎 Documentación:\n`;
+        body += `  ${meeting.documentation}\n`;
+        body += `\n`;
+      }
+
+      body += buildMeetingCalendarActionsText(meeting, spreadsheetUrl, {
+        includeAdd: false,
+        includeUpdate: true,
+        includeDelete: false,
+        includeMessageAll: true
+      }, attendeeEmail, ownerEmail);
+
+      body += `  → Esta reunión fue pospuesta\n\n`;
+      body += `───────────────────────────────────────────────────────\n\n`;
+    });
+  }
+
+  // Section 5: Cancelled meetings
+  if (cancelledMeetings.length > 0) {
+    cancelledMeetings.forEach(changeObj => {
+      const meeting = changeObj.meeting;
+      const previousMeeting = changeObj.previousMeeting;
+
+      body += `❌ REUNIÓN CANCELADA\n\n`;
+      body += `📅 ${meeting.title}\n`;
+      body += `  Fecha y hora original: ${formatMeetingDateTime(previousMeeting.datetime)}\n`;
+      body += `  Estado: ${meeting.status}\n`;
+      if (meeting.attendees) {
+        body += `  Asistentes: ${meeting.attendees}\n`;
+      }
+      body += `\n`;
+
+      body += buildMeetingCalendarActionsText(meeting, spreadsheetUrl, {
+        includeAdd: false,
+        includeUpdate: false,
+        includeDelete: true,
+        includeMessageAll: true
+      }, attendeeEmail, ownerEmail);
+
+      body += `  → Esta reunión fue cancelada\n\n`;
+      body += `───────────────────────────────────────────────────────\n\n`;
+    });
+  }
+
   body += `═══════════════════════════════════════════════════════\n\n`;
   body += `Ver el calendario completo: ${spreadsheetUrl}\n\n`;
   body += `Notificación enviada: ${formatDateTime(new Date())}\n\n`;
@@ -1816,12 +2073,14 @@ function buildMeetingEmailBody(attendeeEmail, newMeetings, changedMeetings, dele
  * @param {Array} newMeetings - New meetings
  * @param {Array} changedMeetings - Changed meetings with change details
  * @param {Array} deletedMeetings - Deleted meetings
+ * @param {Array} postponedMeetings - Postponed meetings with change details
+ * @param {Array} cancelledMeetings - Cancelled meetings with change details
  * @param {string} spreadsheetUrl - Spreadsheet URL
  * @param {string} ownerEmail - Notification sender email
  * @returns {string} Formatted HTML body
  */
-function buildMeetingEmailHtml(attendeeEmail, newMeetings, changedMeetings, deletedMeetings, spreadsheetUrl, ownerEmail) {
-  const totalChanges = newMeetings.length + changedMeetings.length + deletedMeetings.length;
+function buildMeetingEmailHtml(attendeeEmail, newMeetings, changedMeetings, deletedMeetings, postponedMeetings, cancelledMeetings, spreadsheetUrl, ownerEmail) {
+  const totalChanges = newMeetings.length + changedMeetings.length + deletedMeetings.length + postponedMeetings.length + cancelledMeetings.length;
   let html = '';
 
   html += '<div style="margin:0;padding:0;background:#f5f7fb;">';
@@ -1862,6 +2121,45 @@ function buildMeetingEmailHtml(attendeeEmail, newMeetings, changedMeetings, dele
         includeDelete: true,
         includeMessageAll: true
       }, 'Esta reunión fue eliminada del calendario.', attendeeEmail, ownerEmail);
+    });
+  }
+
+  if (postponedMeetings.length > 0) {
+    postponedMeetings.forEach(changeObj => {
+      const meeting = changeObj.meeting;
+      const previousMeeting = changeObj.previousMeeting;
+      const postponedChangesHtml =
+        '<div style="margin-top:8px;padding:10px;background:#ecfeff;border:1px solid #bae6fd;border-radius:8px;">' +
+        '<p style="margin:0 0 6px 0;font-size:13px;font-weight:700;color:#075985;">Reprogramación detectada</p>' +
+        `<p style="margin:0 0 4px 0;font-size:13px;color:#0f172a;"><strong>Fecha y hora anterior:</strong> ${escapeHtml(formatMeetingDateTime(previousMeeting.datetime))}</p>` +
+        `<p style="margin:0;font-size:13px;color:#0f172a;"><strong>Nueva fecha y hora:</strong> ${escapeHtml(formatMeetingDateTime(meeting.datetime))}</p>` +
+        '</div>';
+
+      html += buildMeetingCardHtml('⏰ REUNIÓN POSPUESTA', '#e0f2fe', '#075985', meeting, postponedChangesHtml, spreadsheetUrl, {
+        includeAdd: false,
+        includeUpdate: true,
+        includeDelete: false,
+        includeMessageAll: true
+      }, 'Esta reunión fue pospuesta.', attendeeEmail, ownerEmail);
+    });
+  }
+
+  if (cancelledMeetings.length > 0) {
+    cancelledMeetings.forEach(changeObj => {
+      const meeting = changeObj.meeting;
+      const previousMeeting = changeObj.previousMeeting;
+      const cancelledChangesHtml =
+        '<div style="margin-top:8px;padding:10px;background:#fff1f2;border:1px solid #fecdd3;border-radius:8px;">' +
+        '<p style="margin:0 0 6px 0;font-size:13px;font-weight:700;color:#9f1239;">Cancelación detectada</p>' +
+        `<p style="margin:0;font-size:13px;color:#0f172a;"><strong>Fecha y hora original:</strong> ${escapeHtml(formatMeetingDateTime(previousMeeting.datetime))}</p>` +
+        '</div>';
+
+      html += buildMeetingCardHtml('❌ REUNIÓN CANCELADA', '#ffe4e6', '#9f1239', meeting, cancelledChangesHtml, spreadsheetUrl, {
+        includeAdd: false,
+        includeUpdate: false,
+        includeDelete: true,
+        includeMessageAll: true
+      }, 'Esta reunión fue cancelada.', attendeeEmail, ownerEmail);
     });
   }
 
