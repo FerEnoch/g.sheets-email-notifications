@@ -12,7 +12,8 @@ This Google Apps Script automatically detects changes in your project management
 - **📧 Granular Notifications** - Only emails people whose tasks actually changed (no spam!)
 - **📝 Detailed Context** - Shows exactly what changed with old → new comparisons
 - **📊 Multi-sheet Support** - Automatically processes all sheets in your spreadsheet
-- **🗂️ History Tracking** - Maintains complete audit trail in dedicated History sheet
+- **🗂️ External History Tracking** - Stores task/meeting history in a dedicated Drive folder and spreadsheet
+- **♻️ 45-Day Backup Rotation** - Keeps current pages under 45 days and archives older rows into backup pages
 - **👥 Consolidated Emails** - One email per person with all their changes grouped together
 - **🎨 HTML Task Emails** - Task notifications are sent as rich HTML with plain-text fallback
 - **🔔 Deletion Notifications** - Alerts previous assignee when tasks are removed
@@ -47,9 +48,10 @@ To enable meeting notifications, create a sheet named "Reuniones" with these col
 | A | Título | Meeting title | ✅ Yes |
 | B | Asistentes | Attendee emails - supports multiple (comma/semicolon separated) | ✅ Yes |
 | C | Estado | Meeting status (use dropdown: Programada, Completada, Cancelada, Pospuesta) | ✅ Yes |
-| D | Fecha_hora | Meeting date and time (use Google Sheets Date time format) | ✅ Yes |
-| E | Agenda | Meeting agenda/topics | ✅ Yes |
-| F | Documentación | Google Drive URLs or notes | ✅ Yes |
+| D | Fecha | Meeting date (use Google Sheets Date format) | ✅ Yes |
+| E | Hora | Meeting time (use Google Sheets Time format) | ✅ Yes |
+| F | Agenda | Meeting agenda/topics | ✅ Yes |
+| G | Documentación | Google Drive URLs or notes | ✅ Yes |
 
 ## 🚀 Quick Start
 
@@ -72,14 +74,16 @@ For detailed instructions, see [DEPLOYMENT_INSTRUCTIONS.md](./DEPLOYMENT_INSTRUC
 ### Task Notifications
 
 #### First Run (Transparency)
-- Creates "Task History" sheet automatically
+- Creates folder `history_and_backup` inside the same Drive folder as the board spreadsheet
+- Creates spreadsheet `history_backup` in that folder automatically
+- Creates current page `Tasks_Current` automatically
 - Treats all tasks as "new"
 - Sends notifications to ALL assignees with their current assignments
 - Saves initial snapshot for future comparisons
 
 #### Subsequent Runs (Granular)
 1. Scans all sheets for tasks
-2. Compares with previous snapshot from History sheet
+2. Compares with previous snapshot from `history_backup/Tasks_Current`
 3. Detects changes:
    - ✨ **New tasks** - Newly assigned
    - 📝 **Changed tasks** - Field values modified
@@ -87,14 +91,14 @@ For detailed instructions, see [DEPLOYMENT_INSTRUCTIONS.md](./DEPLOYMENT_INSTRUC
    - ⏭️ **Unchanged tasks** - Skipped (no notification)
 4. Groups changes by assignee email
 5. Sends ONE consolidated email per person (HTML + plain-text fallback)
-6. Saves new snapshot to History sheet
+6. Saves new snapshot to `history_backup/Tasks_Current`
 7. Shows summary alert with statistics
 
 ### Meeting Notifications
 
 Works identically to task notifications but:
 - Uses the "Reuniones" sheet instead of task sheets
-- Creates a separate "_meetings_history" sheet
+- Uses current page `Meetings_Current` in the external `history_backup` spreadsheet
 - Sends meeting-specific email format
 - Includes Google Calendar action links in emails:
   - Add to Google Calendar (prefilled event)
@@ -119,43 +123,43 @@ Both tasks and meetings support multiple email addresses:
 ## 📨 Email Format Example
 
 ```
-Subject: Task Updates - changes require your attention
+Subject: Actualización de tareas - se requiere su atención
 
-Hi there,
+Hola,
 
-You have 2 tasks that were recently updated in the project management board:
+Tienes 2 tarea(s) que fueron actualizadas recientemente en el tablero de gestión de proyectos:
 
 ═══════════════════════════════════════════════════════
 
-✨ NEW TASK ASSIGNED TO YOU
+✨ NUEVA TAREA ASIGNADA A TI en la hoja Sprint-3
 
-Task: Implement OAuth integration
-  Priority: High
-  Status: Not Started
-  Product: Customer Portal
-  Start Date: 26-02-2026
-  Due Date: 05-03-2026
-  Notes: Use Google OAuth 2.0
+Tarea: Implementar integración OAuth
+  Prioridad: Alta
+  Estado: No iniciada
+  Producto: Portal de clientes
+  Fecha de inicio: 26-02-2026
+  Fecha de finalización: 05-03-2026
+  Notas: Usar Google OAuth 2.0
   
-  → This task was newly assigned to you
+  → Esta tarea fue asignada recientemente a ti
 
 ───────────────────────────────────────────────────────
 
-📝 TASK UPDATED
+📝 TAREA ACTUALIZADA en la hoja Sprint-3
 
-Task: Fix mobile responsiveness
-  Priority: Medium → High ⚠️
-  Status: Not Started → In Progress ✓
-  Due Date: 28-02-2026 → 05-03-2026
-  Product: Marketing Site
-  Notes: Focus on tablet view
+Tarea: Corregir diseño responsivo móvil
+  Prioridad: Media → Alta ⚠️
+  Estado: No iniciada → En progreso ✓
+  Fecha de finalización: 28-02-2026 → 05-03-2026
+  Producto: Sitio de marketing
+  Notas: Enfoque en vista tablet
   
-  → 3 field(s) changed since last notification
+  → 3 cambios desde la última notificación
 
 ═══════════════════════════════════════════════════════
 
-View the full board: [Link to spreadsheet]
-Notification sent: 26-02-2026 14:30
+Ver el tablero completo: [Enlace a la hoja de cálculo]
+Notificación enviada: 26-02-2026 14:30
 ```
 
 ## 🔧 Configuration
@@ -164,7 +168,13 @@ All settings can be customized in the `CONFIG` object at the top of `Code.gs`:
 
 ```javascript
 const CONFIG = {
-  HISTORY_SHEET_NAME: 'Task History',
+  HISTORY: {
+    FOLDER_NAME: 'history_and_backup',
+    SPREADSHEET_NAME: 'history_backup',
+    RETENTION_DAYS: 45,
+    TASKS_CURRENT_SHEET_NAME: 'Tasks_Current',
+    MEETINGS_CURRENT_SHEET_NAME: 'Meetings_Current'
+  },
   EMAIL_SUBJECT: 'Task Updates - changes require your attention',
   HEADER_ROW: 1,
   FIRST_DATA_ROW: 2,
@@ -185,9 +195,21 @@ COLUMNS: {
 }
 ```
 
-## 📊 Understanding the History Sheet
+## 📊 Understanding External History Storage
 
-The script automatically creates a "Task History" sheet with these columns:
+The script stores history in Google Drive using:
+- Folder: `history_and_backup` (inside the same folder as the board spreadsheet)
+- Spreadsheet: `history_backup`
+
+Current pages (< 45 days):
+- `Tasks_Current`
+- `Meetings_Current`
+
+Backup pages (> 45 days), split by 45-day windows:
+- `Tasks_Backup_YYYY-MM-DD_to_YYYY-MM-DD`
+- `Meetings_Backup_YYYY-MM-DD_to_YYYY-MM-DD`
+
+Each history page uses these columns:
 
 - **Timestamp** - When snapshot was taken
 - **Sheet** - Source sheet name
@@ -196,7 +218,7 @@ The script automatically creates a "Task History" sheet with these columns:
 - **Action** - NEW, CHANGED, DELETED, or UNCHANGED
 - **Notified** - YES if email sent, NO if skipped
 
-**⚠️ Important:** Don't delete this sheet! It's required for change detection.
+**⚠️ Important:** Don't delete `history_backup`. It is required for change detection and backup tracking.
 
 ## 🎯 Use Cases
 
@@ -211,7 +233,8 @@ Perfect for:
 
 The script requires these Google permissions:
 
-- **View and manage spreadsheets** - Read task data and create History sheet
+- **View and manage spreadsheets** - Read task/meeting board data and maintain external history pages
+- **View and manage Drive files/folders** - Create and manage the external history folder/spreadsheet
 - **Send email as you** - Send notifications to assignees
 - **Display content in Google apps** - Show menu and alerts
 
@@ -254,7 +277,6 @@ Possible additions (not currently implemented):
 
 - Automatic triggers on cell edits
 - Daily/weekly digest emails
-- HTML formatted emails
 - User preference settings per assignee
 - Filter by specific sheet names
 - Slack/Teams integration
@@ -262,16 +284,28 @@ Possible additions (not currently implemented):
 
 ## 📝 Version
 
-- **Version:** 2.0
+- **Version:** 3.1
 - **Last Updated:** March 2026
 - **Compatibility:** Google Apps Script (Google Sheets)
 
 ### Changelog
 
+**v3.0.1**
+- Updated backup history folder location to be created inside the same Drive folder as the board spreadsheet (instead of root Drive)
+
+**v3.0** (March 2026)
+- Added meeting notification system with separate "Reuniones" sheet
+- Added Google Calendar action links in meeting emails (add/update/delete helper actions)
+- Added "Send message to all attendees" link in meeting emails (opens mail client draft)
+- Updated email formatting for meetings
+- Added "Send message to all attendees" link in meeting emails (opens mail client draft)
+
 **v2.0** (March 2026)
 - Added multi-assignee support for tasks (comma/semicolon separated emails)
 - Added meeting notification system with separate "Reuniones" sheet
-- Added independent history tracking for meetings (_meetings_history)
+- Moved all history tracking to external Drive folder `history_and_backup`
+- Added external history spreadsheet `history_backup` with separate current pages
+- Added 45-day backup page rotation for tasks and meetings
 - Added Google Calendar action links in meeting emails (add/update/delete helper actions)
 
 **v1.0** (February 2026)

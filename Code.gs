@@ -4,7 +4,7 @@
  * ================================================================================
  * 
  * This Google Apps Script adds intelligent task change notifications to your
- * project management spreadsheet.MP
+ * project management spreadsheet.
  * 
  * Features:
  * - Automatically detects changes in tasks across all sheets
@@ -27,8 +27,16 @@
 // ================================================================================
 
 const CONFIG = {
-  // History tracking sheet name
-  HISTORY_SHEET_NAME: '_task_history',
+  // External history and backup storage
+  HISTORY: {
+    FOLDER_NAME: 'history_and_backup',
+    SPREADSHEET_NAME: 'history_backup',
+    RETENTION_DAYS: 45,
+    TASKS_CURRENT_SHEET_NAME: 'Tasks_Current',
+    MEETINGS_CURRENT_SHEET_NAME: 'Meetings_Current',
+    TASKS_BACKUP_SHEET_PREFIX: 'Tasks_Backup',
+    MEETINGS_BACKUP_SHEET_PREFIX: 'Meetings_Backup'
+  },
 
   // Column indices (0-based, matching spreadsheet structure)
   COLUMNS: {
@@ -87,7 +95,7 @@ const CONFIG = {
       `• ${deletedCount} tarea(s) eliminada(s)\n` +
       `• ${unchangedCount} tarea(s) sin cambios (no notificadas)\n\n` +
       `📧 Correos enviados a ${emailsSent} asignado(s)\n\n` +
-      `Snapshot guardado en la hoja ${CONFIG.HISTORY_SHEET_NAME}.`,
+      `Snapshot guardado en ${CONFIG.HISTORY.SPREADSHEET_NAME}/${CONFIG.HISTORY.TASKS_CURRENT_SHEET_NAME}.`,
     EMAIL_NOTIFICATION_FAILED: (email) => `Error al enviar correo a ${email}.`
   },
 
@@ -97,7 +105,6 @@ const CONFIG = {
 
   MEETINGS: {
     SHEET_NAME: 'Reuniones',
-    HISTORY_SHEET_NAME: '_meetings_history',
     EMAIL_SUBJECT: 'Reunión de equipo - convocatoria',
     MENU_ITEM: 'Notificar reuniones',
     COMPLETED_STATUS: 'Completada',
@@ -146,7 +153,7 @@ const CONFIG = {
         `• ${cancelledCount} reunión(es) cancelada(s) detectada(s)\n` +
         `• ${unchangedCount} reunión(es) sin cambios (no notificadas)\n\n` +
         `📧 Correos enviados a ${emailsSent} asistente(s)\n\n` +
-        `Snapshot guardado en la hoja ${CONFIG.MEETINGS.HISTORY_SHEET_NAME}.`
+        `Snapshot guardado en ${CONFIG.HISTORY.SPREADSHEET_NAME}/${CONFIG.HISTORY.MEETINGS_CURRENT_SHEET_NAME}.`
     }
   }
 };
@@ -179,11 +186,17 @@ function onOpen() {
  */
 function notifyTaskAssignees() {
   try {
-    const startTime = new Date();
     const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
 
     // Step 1: Ensure History sheet exists
     createHistorySheet();
+
+    // Step 1.1: Archive records older than retention window
+    try {
+      rotateTasksHistoryIfNeeded();
+    } catch (archiveError) {
+      Logger.log(`Task history rotation warning: ${archiveError.toString()}`);
+    }
 
     // Step 2: Get all current tasks from all sheets
     const currentTasks = getAllTasks();
@@ -237,7 +250,6 @@ function notifyTaskAssignees() {
  */
 function notifyMeetingAttendees() {
   try {
-    const startTime = new Date();
     const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
 
     // Validate required Reuniones structure before processing.
@@ -249,6 +261,13 @@ function notifyMeetingAttendees() {
 
     // Step 1: Ensure Meetings History sheet exists
     createMeetingsHistorySheet();
+
+    // Step 1.1: Archive records older than retention window
+    try {
+      rotateMeetingsHistoryIfNeeded();
+    } catch (archiveError) {
+      Logger.log(`Meetings history rotation warning: ${archiveError.toString()}`);
+    }
 
     // Step 2: Get all current meetings from Reuniones sheet
     const currentMeetings = getAllMeetings();
@@ -314,11 +333,9 @@ function getAllTasks() {
   const allTasks = [];
 
   sheets.forEach(sheet => {
-    // Skip History and Meetings sheets
+    // Skip Meetings sheet
     if (
-      sheet.getName() === CONFIG.HISTORY_SHEET_NAME
-      || sheet.getName() === CONFIG.MEETINGS.HISTORY_SHEET_NAME
-      || sheet.getName() === CONFIG.MEETINGS.SHEET_NAME
+      sheet.getName() === CONFIG.MEETINGS.SHEET_NAME
     ) {
       return;
     }
@@ -404,14 +421,14 @@ function validateMeetingsSheetStructure(spreadsheet) {
     };
   }
 
-  // if (sheet.getLastColumn() < 7) {
-  //   return {
-  //     isValid: false,
-  //     message:
-  //       'La hoja Reuniones requiere 7 columnas en este orden: ' +
-  //       'Título, Asistentes, Estado, Fecha, Hora, Agenda, Documentación.'
-  //   };
-  // }
+  if (sheet.getLastColumn() < 7) {
+    return {
+      isValid: false,
+      message:
+        'La hoja Reuniones requiere 7 columnas en este orden: ' +
+        'Título, Asistentes, Estado, Fecha, Hora, Agenda, Documentación.'
+    };
+  }
 
   const headers = sheet.getRange(CONFIG.MEETINGS.HEADER_ROW, 1, 1, 7).getValues()[0]
     .map(value => normalizeStringForComparison(value).toLowerCase());
@@ -537,21 +554,270 @@ function getTaskFromRow(sheet, row, rowIndex) {
 // ================================================================================
 
 /**
+ * Gets or creates the Drive folder that stores history and backups.
+ * Folder is created inside the same parent folder as the active board spreadsheet.
+ * @returns {Folder} Destination folder
+ */
+function getOrCreateHistoryFolder() {
+  const activeSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const boardFile = DriveApp.getFileById(activeSpreadsheet.getId());
+  const parents = boardFile.getParents();
+
+  if (!parents.hasNext()) {
+    throw new Error('El tablero principal debe estar dentro de una carpeta de Drive para crear history_and_backup en esa misma ubicación.');
+  }
+
+  const boardParentFolder = parents.next();
+  const folders = boardParentFolder.getFoldersByName(CONFIG.HISTORY.FOLDER_NAME);
+
+  if (folders.hasNext()) {
+    return folders.next();
+  }
+
+  const folder = boardParentFolder.createFolder(CONFIG.HISTORY.FOLDER_NAME);
+  Logger.log(`Created history folder in board parent folder: ${CONFIG.HISTORY.FOLDER_NAME}`);
+  return folder;
+}
+
+/**
+ * Gets or creates the external spreadsheet that stores current history and backups.
+ * @returns {Spreadsheet} History spreadsheet
+ */
+function getOrCreateHistorySpreadsheet() {
+  const folder = getOrCreateHistoryFolder();
+  const files = folder.getFilesByName(CONFIG.HISTORY.SPREADSHEET_NAME);
+
+  while (files.hasNext()) {
+    const file = files.next();
+    try {
+      return SpreadsheetApp.openById(file.getId());
+    } catch (error) {
+      Logger.log(`Skipping non-spreadsheet file while searching history file: ${file.getName()}`);
+    }
+  }
+
+  const spreadsheet = SpreadsheetApp.create(CONFIG.HISTORY.SPREADSHEET_NAME);
+  const file = DriveApp.getFileById(spreadsheet.getId());
+  folder.addFile(file);
+
+  // Keep root uncluttered if script has permission to remove from My Drive root.
+  try {
+    DriveApp.getRootFolder().removeFile(file);
+  } catch (error) {
+    Logger.log('Could not remove history spreadsheet from root folder. Continuing.');
+  }
+
+  Logger.log(`Created history spreadsheet: ${CONFIG.HISTORY.SPREADSHEET_NAME}`);
+  return spreadsheet;
+}
+
+/**
+ * Ensures a sheet exists with expected headers in the external history spreadsheet.
+ * @param {Spreadsheet} historySpreadsheet - External history spreadsheet
+ * @param {string} sheetName - Target sheet name
+ * @param {Array} headers - Required header row
+ * @returns {Sheet} Existing or newly created sheet
+ */
+function getOrCreateHistoryDataSheet(historySpreadsheet, sheetName, headers) {
+  let sheet = historySpreadsheet.getSheetByName(sheetName);
+
+  if (!sheet) {
+    sheet = historySpreadsheet.insertSheet(sheetName);
+  }
+
+  const mustInitializeHeaders = sheet.getLastRow() < 1;
+
+  if (mustInitializeHeaders) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  } else {
+    const existingHeaders = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+    const headersMatch = headers.every((header, index) =>
+      normalizeStringForComparison(existingHeaders[index]) === normalizeStringForComparison(header)
+    );
+
+    if (!headersMatch) {
+      sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    }
+  }
+
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+
+  return sheet;
+}
+
+/**
+ * Builds a deterministic signature for one history row.
+ * @param {Array} row - History row values
+ * @returns {string} Unique row signature
+ */
+function buildHistoryRowSignature(row) {
+  const timezone = Session.getScriptTimeZone();
+  return row.map(value => {
+    if (value instanceof Date) {
+      return Utilities.formatDate(value, timezone, "yyyy-MM-dd'T'HH:mm:ss");
+    }
+    return normalizeStringForComparison(value);
+  }).join('\u241F');
+}
+
+/**
+ * Appends only rows that do not already exist in a target history sheet.
+ * @param {Sheet} targetSheet - Backup target sheet
+ * @param {Array<Array>} rows - Rows to append
+ * @returns {number} Number of rows appended
+ */
+function appendUniqueRowsToHistorySheet(targetSheet, rows) {
+  if (!targetSheet || !rows || rows.length === 0) {
+    return 0;
+  }
+
+  const existingSignatures = new Set();
+  const headersLength = rows[0].length;
+
+  if (targetSheet.getLastRow() > 1) {
+    const existing = targetSheet.getRange(2, 1, targetSheet.getLastRow() - 1, headersLength).getValues();
+    existing.forEach(row => existingSignatures.add(buildHistoryRowSignature(row)));
+  }
+
+  const uniqueRows = rows.filter(row => {
+    const signature = buildHistoryRowSignature(row);
+    if (existingSignatures.has(signature)) {
+      return false;
+    }
+    existingSignatures.add(signature);
+    return true;
+  });
+
+  if (uniqueRows.length === 0) {
+    return 0;
+  }
+
+  targetSheet.getRange(targetSheet.getLastRow() + 1, 1, uniqueRows.length, uniqueRows[0].length).setValues(uniqueRows);
+  return uniqueRows.length;
+}
+
+/**
+ * Computes deterministic 45-day window bounds for backup page names.
+ * @param {Date} timestamp - Row timestamp
+ * @returns {{start: Date, end: Date, startKey: string, endKey: string}} Window details
+ */
+function getBackupWindowBounds(timestamp) {
+  const timezone = Session.getScriptTimeZone();
+  const windowMs = CONFIG.HISTORY.RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const windowIndex = Math.floor(timestamp.getTime() / windowMs);
+  const start = new Date(windowIndex * windowMs);
+  const end = new Date((windowIndex + 1) * windowMs - 1);
+
+  return {
+    start: start,
+    end: end,
+    startKey: Utilities.formatDate(start, timezone, 'yyyy-MM-dd'),
+    endKey: Utilities.formatDate(end, timezone, 'yyyy-MM-dd')
+  };
+}
+
+/**
+ * Rotates old rows from a current history page into 45-day backup pages.
+ * @param {string} currentSheetName - Current active history sheet
+ * @param {Array} headers - Expected headers
+ * @param {string} backupPrefix - Prefix for backup page names
+ */
+function rotateHistorySheetIfNeeded(currentSheetName, headers, backupPrefix) {
+  const historySpreadsheet = getOrCreateHistorySpreadsheet();
+  const currentSheet = getOrCreateHistoryDataSheet(historySpreadsheet, currentSheetName, headers);
+
+  if (currentSheet.getLastRow() <= 1) {
+    return;
+  }
+
+  const now = new Date();
+  const retentionMs = CONFIG.HISTORY.RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const rows = currentSheet.getRange(2, 1, currentSheet.getLastRow() - 1, headers.length).getValues();
+  const keepRows = [];
+  const archiveGroups = new Map();
+
+  rows.forEach(row => {
+    const timestamp = parseLocalizedDateOrDateTime(row[0]);
+
+    // Keep unknown timestamp formats in current history to avoid accidental data loss.
+    if (!timestamp) {
+      keepRows.push(row);
+      return;
+    }
+
+    const ageMs = now.getTime() - timestamp.getTime();
+    if (ageMs < retentionMs) {
+      keepRows.push(row);
+      return;
+    }
+
+    const window = getBackupWindowBounds(timestamp);
+    const groupKey = `${window.startKey}_${window.endKey}`;
+
+    if (!archiveGroups.has(groupKey)) {
+      archiveGroups.set(groupKey, { window: window, rows: [] });
+    }
+
+    archiveGroups.get(groupKey).rows.push(row);
+  });
+
+  if (archiveGroups.size === 0) {
+    return;
+  }
+
+  archiveGroups.forEach(group => {
+    const backupSheetName = `${backupPrefix}_${group.window.startKey}_to_${group.window.endKey}`;
+    const backupSheet = getOrCreateHistoryDataSheet(historySpreadsheet, backupSheetName, headers);
+    const appendedCount = appendUniqueRowsToHistorySheet(backupSheet, group.rows);
+    Logger.log(`Archived ${appendedCount} row(s) into ${backupSheetName}`);
+  });
+
+  const previousLastRow = currentSheet.getLastRow();
+  currentSheet.getRange(2, 1, previousLastRow - 1, headers.length).clearContent();
+
+  if (keepRows.length > 0) {
+    currentSheet.getRange(2, 1, keepRows.length, headers.length).setValues(keepRows);
+  }
+
+  const desiredRows = Math.max(keepRows.length + 1, 2);
+  if (currentSheet.getMaxRows() > desiredRows) {
+    currentSheet.deleteRows(desiredRows + 1, currentSheet.getMaxRows() - desiredRows);
+  }
+}
+
+/**
+ * Rotates task history when rows are older than retention threshold.
+ */
+function rotateTasksHistoryIfNeeded() {
+  rotateHistorySheetIfNeeded(
+    CONFIG.HISTORY.TASKS_CURRENT_SHEET_NAME,
+    CONFIG.HISTORY_SHEET_HEADERS,
+    CONFIG.HISTORY.TASKS_BACKUP_SHEET_PREFIX
+  );
+}
+
+/**
+ * Rotates meetings history when rows are older than retention threshold.
+ */
+function rotateMeetingsHistoryIfNeeded() {
+  rotateHistorySheetIfNeeded(
+    CONFIG.HISTORY.MEETINGS_CURRENT_SHEET_NAME,
+    CONFIG.MEETINGS.HISTORY_HEADERS,
+    CONFIG.HISTORY.MEETINGS_BACKUP_SHEET_PREFIX
+  );
+}
+
+/**
  * Creates the History sheet if it doesn't exist
  */
 function createHistorySheet() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  let historySheet = spreadsheet.getSheetByName(CONFIG.HISTORY_SHEET_NAME);
-
-  if (!historySheet) {
-    historySheet = spreadsheet.insertSheet(CONFIG.HISTORY_SHEET_NAME);
-
-    historySheet.getRange(1, 1, 1, CONFIG.HISTORY_SHEET_HEADERS.length).setValues([CONFIG.HISTORY_SHEET_HEADERS]);
-    historySheet.getRange(1, 1, 1, CONFIG.HISTORY_SHEET_HEADERS.length).setFontWeight('bold');
-    historySheet.setFrozenRows(1);
-
-    Logger.log('Created History sheet');
-  }
+  const historySpreadsheet = getOrCreateHistorySpreadsheet();
+  getOrCreateHistoryDataSheet(
+    historySpreadsheet,
+    CONFIG.HISTORY.TASKS_CURRENT_SHEET_NAME,
+    CONFIG.HISTORY_SHEET_HEADERS
+  );
 }
 
 /**
@@ -559,8 +825,12 @@ function createHistorySheet() {
  * @returns {Map} Map of taskId+email to most recent task state
  */
 function getPreviousSnapshot() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const historySheet = spreadsheet.getSheetByName(CONFIG.HISTORY_SHEET_NAME);
+  const historySpreadsheet = getOrCreateHistorySpreadsheet();
+  const historySheet = getOrCreateHistoryDataSheet(
+    historySpreadsheet,
+    CONFIG.HISTORY.TASKS_CURRENT_SHEET_NAME,
+    CONFIG.HISTORY_SHEET_HEADERS
+  );
 
   const snapshot = new Map();
 
@@ -612,8 +882,12 @@ function getPreviousSnapshot() {
  * @param {Object} changes - Change detection results
  */
 function saveSnapshot(tasks, changes) {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const historySheet = spreadsheet.getSheetByName(CONFIG.HISTORY_SHEET_NAME);
+  const historySpreadsheet = getOrCreateHistorySpreadsheet();
+  const historySheet = getOrCreateHistoryDataSheet(
+    historySpreadsheet,
+    CONFIG.HISTORY.TASKS_CURRENT_SHEET_NAME,
+    CONFIG.HISTORY_SHEET_HEADERS
+  );
 
   if (!historySheet) {
     return;
@@ -624,16 +898,26 @@ function saveSnapshot(tasks, changes) {
 
   // Create a set of notified task keys (taskId + email)
   const notifiedKeys = new Set();
-  changes.new.forEach(t => notifiedKeys.add(`${t.taskId}|${t.email}`));
-  changes.changed.forEach(t => notifiedKeys.add(`${t.task.taskId}|${t.task.email}`));
+  const newKeys = new Set();
+  const changedKeys = new Set();
+  changes.new.forEach(t => {
+    const key = `${t.taskId}|${t.email}`;
+    notifiedKeys.add(key);
+    newKeys.add(key);
+  });
+  changes.changed.forEach(t => {
+    const key = `${t.task.taskId}|${t.task.email}`;
+    notifiedKeys.add(key);
+    changedKeys.add(key);
+  });
 
   // Add current state of all tasks
   tasks.forEach(task => {
     const currentKey = `${task.taskId}|${task.email}`;
     let action = 'UNCHANGED';
-    if (changes.new.find(t => `${t.taskId}|${t.email}` === currentKey)) {
+    if (newKeys.has(currentKey)) {
       action = 'NEW';
-    } else if (changes.changed.find(t => `${t.task.taskId}|${t.task.email}` === currentKey)) {
+    } else if (changedKeys.has(currentKey)) {
       action = 'CHANGED';
     }
 
@@ -687,18 +971,12 @@ function saveSnapshot(tasks, changes) {
  * Creates the Meetings History sheet if it doesn't exist
  */
 function createMeetingsHistorySheet() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  let historySheet = spreadsheet.getSheetByName(CONFIG.MEETINGS.HISTORY_SHEET_NAME);
-
-  if (!historySheet) {
-    historySheet = spreadsheet.insertSheet(CONFIG.MEETINGS.HISTORY_SHEET_NAME);
-
-    historySheet.getRange(1, 1, 1, CONFIG.MEETINGS.HISTORY_HEADERS.length).setValues([CONFIG.MEETINGS.HISTORY_HEADERS]);
-    historySheet.getRange(1, 1, 1, CONFIG.MEETINGS.HISTORY_HEADERS.length).setFontWeight('bold');
-    historySheet.setFrozenRows(1);
-
-    Logger.log('Created Meetings History sheet');
-  }
+  const historySpreadsheet = getOrCreateHistorySpreadsheet();
+  getOrCreateHistoryDataSheet(
+    historySpreadsheet,
+    CONFIG.HISTORY.MEETINGS_CURRENT_SHEET_NAME,
+    CONFIG.MEETINGS.HISTORY_HEADERS
+  );
 }
 
 /**
@@ -706,8 +984,12 @@ function createMeetingsHistorySheet() {
  * @returns {Map} Map of meetingId+email to most recent meeting state
  */
 function getPreviousMeetingsSnapshot() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const historySheet = spreadsheet.getSheetByName(CONFIG.MEETINGS.HISTORY_SHEET_NAME);
+  const historySpreadsheet = getOrCreateHistorySpreadsheet();
+  const historySheet = getOrCreateHistoryDataSheet(
+    historySpreadsheet,
+    CONFIG.HISTORY.MEETINGS_CURRENT_SHEET_NAME,
+    CONFIG.MEETINGS.HISTORY_HEADERS
+  );
 
   const snapshot = new Map();
 
@@ -732,15 +1014,19 @@ function getPreviousMeetingsSnapshot() {
 
     // Only store the first (most recent) occurrence of each meeting+email combination
     if (!snapshot.has(key)) {
+      // Parse the stored datetime so date/time normalization works correctly
+      // against current meeting data that has properly separated date/time values.
+      const parsedDatetime = parseLocalizedDateOrDateTime(row[5]);
+
       snapshot.set(key, {
         meetingId: meetingId,
         title: row[2],
         attendees: row[3],
         email: email,
         status: row[4],
-        datetime: row[5],
-        date: row[5],
-        time: row[5],
+        datetime: parsedDatetime || row[5],
+        date: parsedDatetime || row[5],
+        time: parsedDatetime || row[5],
         agenda: row[6],
         documentation: row[7],
         action: row[8]
@@ -757,8 +1043,12 @@ function getPreviousMeetingsSnapshot() {
  * @param {Object} changes - Change detection results
  */
 function saveMeetingsSnapshot(meetings, changes) {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const historySheet = spreadsheet.getSheetByName(CONFIG.MEETINGS.HISTORY_SHEET_NAME);
+  const historySpreadsheet = getOrCreateHistorySpreadsheet();
+  const historySheet = getOrCreateHistoryDataSheet(
+    historySpreadsheet,
+    CONFIG.HISTORY.MEETINGS_CURRENT_SHEET_NAME,
+    CONFIG.MEETINGS.HISTORY_HEADERS
+  );
 
   if (!historySheet) {
     return;
@@ -772,22 +1062,42 @@ function saveMeetingsSnapshot(meetings, changes) {
 
   // Create a set of notified meeting keys (meetingId + email)
   const notifiedKeys = new Set();
-  changes.new.forEach(m => notifiedKeys.add(`${m.meetingId}|${m.email}`));
-  changes.changed.forEach(m => notifiedKeys.add(`${m.meeting.meetingId}|${m.meeting.email}`));
-  changes.postponed.forEach(m => notifiedKeys.add(`${m.meeting.meetingId}|${m.meeting.email}`));
-  changes.cancelled.forEach(m => notifiedKeys.add(`${m.meeting.meetingId}|${m.meeting.email}`));
+  const newKeys = new Set();
+  const changedKeys = new Set();
+  const postponedKeys = new Set();
+  const cancelledKeys = new Set();
+  changes.new.forEach(m => {
+    const key = `${m.meetingId}|${m.email}`;
+    notifiedKeys.add(key);
+    newKeys.add(key);
+  });
+  changes.changed.forEach(m => {
+    const key = `${m.meeting.meetingId}|${m.meeting.email}`;
+    notifiedKeys.add(key);
+    changedKeys.add(key);
+  });
+  changes.postponed.forEach(m => {
+    const key = `${m.meeting.meetingId}|${m.meeting.email}`;
+    notifiedKeys.add(key);
+    postponedKeys.add(key);
+  });
+  changes.cancelled.forEach(m => {
+    const key = `${m.meeting.meetingId}|${m.meeting.email}`;
+    notifiedKeys.add(key);
+    cancelledKeys.add(key);
+  });
 
   // Add current state of all meetings
   meetings.forEach(meeting => {
     const currentKey = `${meeting.meetingId}|${meeting.email}`;
     let action = 'UNCHANGED';
-    if (changes.postponed.find(m => `${m.meeting.meetingId}|${m.meeting.email}` === currentKey)) {
+    if (postponedKeys.has(currentKey)) {
       action = 'POSTPONED';
-    } else if (changes.cancelled.find(m => `${m.meeting.meetingId}|${m.meeting.email}` === currentKey)) {
+    } else if (cancelledKeys.has(currentKey)) {
       action = 'CANCELLED';
-    } else if (changes.new.find(m => `${m.meetingId}|${m.email}` === currentKey)) {
+    } else if (newKeys.has(currentKey)) {
       action = 'NEW';
-    } else if (changes.changed.find(m => `${m.meeting.meetingId}|${m.meeting.email}` === currentKey)) {
+    } else if (changedKeys.has(currentKey)) {
       action = 'CHANGED';
     }
 
@@ -1298,6 +1608,11 @@ function sendChangeNotifications(changes, spreadsheetUrl) {
 
   tasksByAssignee.forEach((tasks, email) => {
     try {
+      if (!isValidEmail(email)) {
+        Logger.log(`Skipping invalid email: ${email}`);
+        return;
+      }
+
       const emailBody = buildEmailBody(
         email,
         tasks.new,
@@ -1706,6 +2021,11 @@ function sendMeetingNotifications(changes, spreadsheetUrl) {
 
   meetingsByAttendee.forEach((meetings, email) => {
     try {
+      if (!isValidEmail(email)) {
+        Logger.log(`Skipping invalid meeting email: ${email}`);
+        return;
+      }
+
       const emailBody = buildMeetingEmailBody(
         email,
         meetings.new,
